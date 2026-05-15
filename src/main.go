@@ -16,6 +16,7 @@ func main() {
 	libPath := flag.String("lib", "lib", "path to native library to inject")
 	debug := flag.Bool("debug", false, "enable debug logging")
 	stealth := flag.Bool("stealth", false, "enable ephemeral payload delivery (ghost mode)")
+	memfd := flag.Bool("memfd", false, "use memfd_create for fileless injection (maximum stealth)")
 	logcat := flag.Bool("logcat", false, "start logcat for child pid after inject")
 
 	flag.Parse()
@@ -31,39 +32,18 @@ func main() {
 
 	LogInfo("starting spawn injector", "package", *pkgName, "payload", *libPath)
 
-	actualLibPath := *libPath
-	stagedPayloadPath := ""
-
-	if *stealth {
-		LogInfo("stealth mode enabled")
-		LogInfo("staging ephemeral payload")
-
-		path, err := stageEphemeralPayload(*pkgName, *libPath)
-		if err != nil {
-			LogError("failed to stage ephemeral payload", "error", err)
-			os.Exit(1)
-		}
-
-		actualLibPath = path
-		stagedPayloadPath = path
-		LogDebug("staged ephemeral payload", "path", path)
-	}
-
-	// Step 1: Kill existing app instance (so we get a clean spawn)
+	// Step 1: Kill existing app instance
 	LogDebug("killing existing app instance", "package", *pkgName)
 	err := ForceStopApp(*pkgName)
 	if err != nil {
 		LogWarn("failed to force-stop app", "error", err)
 	}
-
-	// Small delay to let the process fully die before respawn
 	time.Sleep(200 * time.Millisecond)
 
 	// Step 2: Locate zygote64
 	LogDebug("locating zygote64")
 	zygotePid, err := FindProcessPid("zygote64")
 	if err != nil {
-		cleanupStagedPayload(stagedPayloadPath, false)
 		LogError("could not find zygote64 pid", "error", err)
 		os.Exit(1)
 	}
@@ -79,30 +59,50 @@ func main() {
 		LogInfo("resolved main activity", "package", *pkgName, "activity", mainActivity)
 	}
 
-	// Step 4: Inject via zygote setArgV0 trap and mailbox handshake
-	childPid, err := RunInjector(*pkgName, actualLibPath, zygotePid, mainActivity)
+	// Step 4: Choose injection mode and execute
+	var childPid int
+
+	if *memfd {
+		// Maximum stealth: memfd_create path (no file on disk at any point)
+		LogInfo("using memfd injection mode")
+		childPid, err = RunMemfdInjector(*pkgName, *libPath, zygotePid, mainActivity)
+	} else {
+		// Standard or stealth file-based injection
+		actualLibPath := *libPath
+		stagedPayloadPath := ""
+
+		if *stealth {
+			LogInfo("stealth mode enabled")
+			path, err := stageEphemeralPayload(*pkgName, *libPath)
+			if err != nil {
+				LogError("failed to stage ephemeral payload", "error", err)
+				os.Exit(1)
+			}
+			actualLibPath = path
+			stagedPayloadPath = path
+			LogDebug("staged ephemeral payload", "path", path)
+		}
+
+		childPid, err = RunInjector(*pkgName, actualLibPath, zygotePid, mainActivity)
+
+		if stagedPayloadPath != "" {
+			cleanupStagedPayload(stagedPayloadPath, err == nil)
+		}
+	}
+
 	if err != nil {
-		cleanupStagedPayload(stagedPayloadPath, false)
 		LogError("injection failed", "error", err)
 		os.Exit(1)
 	}
 
-	if stagedPayloadPath != "" {
-		cleanupStagedPayload(stagedPayloadPath, true)
-		LogInfo("ghost sequence complete")
-	}
-
-	LogInfo("injection sequence complete")
+	LogInfo("injection sequence complete", "pid", childPid)
 
 	if *logcat && childPid > 0 {
 		LogInfo("starting logcat", "pid", childPid)
 		cmd := exec.Command("logcat", "-v", "brief", fmt.Sprintf("--pid=%d", childPid))
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		err := cmd.Run()
-		if err != nil {
-			LogError("logcat exited with error", "error", err)
-		}
+		_ = cmd.Run()
 	}
 }
 
@@ -127,7 +127,6 @@ func stageEphemeralPayload(pkgName string, srcPath string) (string, error) {
 		}
 	}
 
-	// Use an innocuous name that blends with normal app cache files
 	stagedName := fmt.Sprintf(".org.chromium.%s.tmp", hex.EncodeToString(randomBytes))
 	stagedPath := filepath.Join(appDataDir, stagedName)
 	if err := os.WriteFile(stagedPath, payloadData, 0755); err != nil {
