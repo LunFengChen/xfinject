@@ -74,7 +74,6 @@ func main() {
 	mainActivity, err := ResolveMainActivity(*pkgName)
 	if err != nil {
 		LogWarn("could not resolve main activity", "error", err)
-		// Fallback: use package name + /.MainActivity (common convention)
 		mainActivity = fmt.Sprintf("%s/.MainActivity", *pkgName)
 	} else {
 		LogInfo("resolved main activity", "package", *pkgName, "activity", mainActivity)

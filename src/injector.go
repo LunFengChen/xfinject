@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// DefaultAPILevel is the assumed Android API level when not specified.
+// Android 13 (API 33) is a reasonable default for modern devices.
+const DefaultAPILevel = 33
+
 func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity string) (int, error) {
 	LogInfo("starting spawn injector", "package", pkgName, "mode", "in-place")
 
@@ -25,23 +29,16 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 	if err != nil {
 		return 0, fmt.Errorf("failed to find RW segment: %v", err)
 	}
-	// Use a randomized offset within the RW segment to avoid signature-based detection
 	mailboxAddr := rwBase + 0x1FF0
 	WriteMem(zygotePid, mailboxAddr, make([]byte, 8))
 
-	origBackup, _ := ReadMem(zygotePid, setArgV0Addr, 256) // Backup more for safety
+	origBackup, _ := ReadMem(zygotePid, setArgV0Addr, 256)
 	linkerBase, _ := GetModuleBase(zygotePid, "linker64")
 	dlopenOffset, _ := FindSymbolOffset("/system/bin/linker64", "__loader_dlopen")
 	dlopenAddr := linkerBase + dlopenOffset
 	LogDebug("resolved loader symbol", "symbol", "dlopen", "addr", dlopenAddr)
 
 	// 2. Build Shellcode Payload
-	// The agnostic shellcode now includes open+unlink+dlopen for stealth:
-	// - Opens the payload file
-	// - Unlinks it from disk (file disappears immediately)
-	// - Calls dlopen (kernel still serves from page cache)
-	// - Closes the fd
-	// This means the payload is gone from the filesystem before anti-tamper runs.
 	trap := BuildAgnosticShellcode(zygotePid, setArgV0Addr, dlopenAddr, mailboxAddr, libPath, origBackup)
 
 	LogInfo("recording zygote children")
@@ -76,7 +73,7 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 		if childPid != 0 {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) // Tighter polling for less timing exposure
 	}
 
 	if childPid == 0 {
@@ -97,11 +94,44 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 			handle := binary.LittleEndian.Uint64(val)
 			if handle != 0 {
 				LogInfo("handshake successful", "handle", handle, "type", "agnostic")
+
+				// Post-injection stealth: run all hiding phases
+				runPostInjectionStealth(childPid, libPath, setArgV0Addr)
+
 				return childPid, nil
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) // Tighter polling
 	}
 
 	return childPid, fmt.Errorf("agnostic handshake timeout")
+}
+
+// runPostInjectionStealth executes all post-dlopen stealth measures.
+// These are best-effort — failures are logged as warnings but don't fail injection.
+func runPostInjectionStealth(childPid int, libPath string, trapAddr uint64) {
+	LogInfo("running post-injection stealth sequence")
+
+	// Small delay to let dlopen fully complete (relocations, constructors)
+	time.Sleep(50 * time.Millisecond)
+
+	// Phase 1: Unlink from soinfo list (hides from dl_iterate_phdr)
+	LogDebug("phase 1: soinfo unlinking")
+	if err := UnlinkSoinfo(childPid, libPath, DefaultAPILevel); err != nil {
+		LogWarn("soinfo unlink failed (non-fatal)", "error", err)
+	}
+
+	// Phase 2: Anonymize memory mappings (hides from /proc/self/maps)
+	LogDebug("phase 2: anonymous remap")
+	if err := AnonymizePayloadMappings(childPid, libPath, trapAddr); err != nil {
+		LogWarn("anonymous remap failed (non-fatal)", "error", err)
+	}
+
+	// Phase 3: Scrub linker artifacts (removes path strings from memory)
+	LogDebug("phase 3: linker scrub")
+	if err := ScrubLinkerArtifacts(childPid, libPath); err != nil {
+		LogWarn("linker scrub failed (non-fatal)", "error", err)
+	}
+
+	LogInfo("post-injection stealth sequence complete")
 }
