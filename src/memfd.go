@@ -48,11 +48,18 @@ func CreateMemfdInZygote(zygotePid int, trapAddr uint64, mailboxAddr uint64) (in
 		return 0, fmt.Errorf("cannot write memfd stub: %w", err)
 	}
 
-	// Hijack a zygote thread to execute it
-	err = hijackThreadForExecution(zygotePid, trapAddr)
-	if err != nil {
+	// Retry hijack — zygote threads may need a moment to settle into a syscall
+	var hijackErr error
+	for attempt := 0; attempt < 20; attempt++ {
+		hijackErr = hijackThreadForExecution(zygotePid, trapAddr)
+		if hijackErr == nil {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if hijackErr != nil {
 		_ = WriteMem(zygotePid, trapAddr, backup)
-		return 0, fmt.Errorf("thread hijack for memfd failed: %w", err)
+		return 0, fmt.Errorf("thread hijack for memfd failed: %w", hijackErr)
 	}
 
 	// Poll mailbox for the fd result
@@ -122,10 +129,18 @@ func WritePayloadToMemfd(pid int, fd int, payloadPath string, trapAddr uint64, m
 			return fmt.Errorf("cannot write write-stub: %w", err)
 		}
 
-		err = hijackThreadForExecution(pid, trapAddr)
-		if err != nil {
+		// Retry hijack — same thread may need a moment to re-enter svc
+		var hijackErr error
+		for attempt := 0; attempt < 10; attempt++ {
+			hijackErr = hijackThreadForExecution(pid, trapAddr)
+			if hijackErr == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if hijackErr != nil {
 			_ = WriteMem(pid, trapAddr, backup)
-			return fmt.Errorf("thread hijack for write failed at offset %d: %w", offset, err)
+			return fmt.Errorf("thread hijack for write failed at offset %d: %w", offset, hijackErr)
 		}
 
 		// Wait for completion
@@ -329,16 +344,34 @@ func RunMemfdInjector(pkgName string, payloadPath string, zygotePid int, mainAct
 	childMailboxAddr := childBase + (mailboxAddr - zygoteBase)
 
 	for time.Now().Before(deadline) {
+		if !IsProcessAlive(childPid) {
+			LogWarn("child exited before memfd stealth sequence", "pid", childPid)
+			fallbackPid, err := FindNewestChildPid(zygotePid, pkgName, 1500*time.Millisecond)
+			if err == nil && fallbackPid != childPid {
+				LogInfo("reattached to relaunched child", "pid", fallbackPid)
+				childPid = fallbackPid
+				childBase, err = GetModuleBase(childPid, "libandroid_runtime.so")
+				if err == nil {
+					childMailboxAddr = childBase + (mailboxAddr - zygoteBase)
+					continue
+				}
+			}
+			return childPid, fmt.Errorf("child process exited before memfd handshake")
+		}
+
 		val, err := ReadPointer(childPid, childMailboxAddr)
 		if err == nil && val != 0 {
 			LogInfo("memfd handshake successful", "handle", val)
 
-			// Post-injection stealth
+			// Best-effort soinfo unlinking for memfd paths.
 			time.Sleep(50 * time.Millisecond)
 			fdPath := fmt.Sprintf("/proc/self/fd/%d", memfd)
-			_ = UnlinkSoinfo(childPid, fdPath, DefaultAPILevel)
-			_ = UnlinkSoinfo(childPid, "memfd:jit-cache", DefaultAPILevel)
-			_ = ScrubLinkerArtifacts(childPid, fdPath)
+			if err := UnlinkSoinfo(childPid, fdPath, DefaultAPILevel); err != nil {
+				LogWarn("soinfo unlink failed (non-fatal)", "error", err)
+			}
+			if err := UnlinkSoinfo(childPid, "memfd:jit-cache", DefaultAPILevel); err != nil {
+				_ = err // don't warn on second unlink
+			}
 
 			return childPid, nil
 		}

@@ -8,18 +8,44 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
+// validZygoteComm returns true if the comm of the process indicates it's
+// the actual zygote, not a forked app that inherited the zygote cmdline.
+// Zygote64's name is "main" (set by prctl PR_SET_NAME). Forked apps show
+// their package name, shells show "sh", etc.
+func validZygoteComm(comm string) bool {
+	switch strings.TrimSpace(comm) {
+	case "main", "zygote64", "zygote":
+		return true
+	}
+	return false
+}
+
 func FindProcessPid(processName string) (int, error) {
-	// Try pgrep first as it is more robust
+	// Use pgrep -f to find candidates, then verify comm to exclude
+	// shell processes running the pgrep command itself, forked apps that
+	// still show the zygote cmdline, etc.
 	out, err := exec.Command("pgrep", "-f", processName).Output()
 	if err == nil {
 		pids := strings.Fields(string(out))
-		if len(pids) > 0 {
-			return strconv.Atoi(pids[0])
+		for _, pidStr := range pids {
+			pid, err := strconv.Atoi(pidStr)
+			if err != nil {
+				continue
+			}
+			commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+			if err != nil {
+				continue
+			}
+			if validZygoteComm(string(commData)) {
+				return pid, nil
+			}
 		}
 	}
 
+	// Fallback: scan /proc manually matching both cmdline and comm
 	files, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, err
@@ -34,17 +60,22 @@ func FindProcessPid(processName string) (int, error) {
 			continue
 		}
 
-		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		if err == nil {
-			// cmdline contains null-terminated strings
-			s := string(bytes.ReplaceAll(cmdline, []byte{0}, []byte(" ")))
-			if strings.Contains(s, processName) {
-				return pid, nil
-			}
+		commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err == nil && validZygoteComm(string(commData)) {
+			return pid, nil
 		}
 
-		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-		if err == nil && strings.TrimSpace(string(comm)) == processName {
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			continue
+		}
+		s := string(bytes.ReplaceAll(cmdline, []byte{0}, []byte(" ")))
+		if strings.Contains(s, processName) {
+			// Found by cmdline — verify comm isn't a package name
+			commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+			if err == nil && !validZygoteComm(string(commData)) {
+				continue // skip forked apps that inherited the cmdline
+			}
 			return pid, nil
 		}
 	}
@@ -55,6 +86,54 @@ func FindProcessPid(processName string) (int, error) {
 func ForceStopApp(pkgName string) error {
 	cmd := exec.Command("am", "force-stop", pkgName)
 	return cmd.Run()
+}
+
+func FindNewestChildPid(parentPid int, match string, timeout time.Duration) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, _ := exec.Command("pgrep", "-P", strconv.Itoa(parentPid)).Output()
+		pids := strings.Fields(string(out))
+
+		for i := len(pids) - 1; i >= 0; i-- {
+			pid, err := strconv.Atoi(pids[i])
+			if err != nil {
+				continue
+			}
+			if match == "" {
+				return pid, nil
+			}
+			cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+			if err != nil {
+				continue
+			}
+			s := string(bytes.ReplaceAll(cmdline, []byte{0}, []byte(" ")))
+			if strings.Contains(s, match) {
+				return pid, nil
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return 0, fmt.Errorf("no child of %d matched %q", parentPid, match)
+}
+
+func WaitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+func IsProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
 }
 
 func ResolveMainActivity(pkgName string) (string, error) {

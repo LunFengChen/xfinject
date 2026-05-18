@@ -85,12 +85,34 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 
 	LogInfo("polling agnostic mailbox")
 	for time.Now().Before(deadline) {
+		if !IsProcessAlive(childPid) {
+			LogWarn("child exited before stealth sequence", "pid", childPid)
+			fallbackPid, err := FindNewestChildPid(zygotePid, pkgName, 1500*time.Millisecond)
+			if err == nil && fallbackPid != childPid {
+				LogInfo("reattached to relaunched child", "pid", fallbackPid)
+				childPid = fallbackPid
+				childBase, err = GetModuleBase(childPid, "libandroid_runtime.so")
+				if err == nil {
+					childMailboxAddr = childBase + (mailboxAddr - zygoteBase)
+					continue
+				}
+			}
+			return childPid, fmt.Errorf("child process exited before handshake")
+		}
+
 		val, err := ReadMem(childPid, childMailboxAddr, 8)
 		if err == nil {
 			handle := binary.LittleEndian.Uint64(val)
 			if handle != 0 {
 				LogInfo("handshake successful", "handle", handle, "type", "agnostic")
-				runPostInjectionStealth(childPid, libPath, setArgV0Addr)
+
+				// Best-effort soinfo unlinking: removes the payload from the
+				// linker's soinfo linked list so dl_iterate_phdr() skips it.
+				time.Sleep(50 * time.Millisecond)
+				if err := UnlinkSoinfo(childPid, libPath, DefaultAPILevel); err != nil {
+					LogWarn("soinfo unlink failed (non-fatal)", "error", err)
+				}
+
 				return childPid, nil
 			}
 		}
@@ -98,26 +120,4 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 	}
 
 	return childPid, fmt.Errorf("agnostic handshake timeout")
-}
-
-func runPostInjectionStealth(childPid int, libPath string, trapAddr uint64) {
-	LogInfo("running post-injection stealth sequence")
-	time.Sleep(50 * time.Millisecond)
-
-	LogDebug("phase 1: soinfo unlinking")
-	if err := UnlinkSoinfo(childPid, libPath, DefaultAPILevel); err != nil {
-		LogWarn("soinfo unlink failed (non-fatal)", "error", err)
-	}
-
-	LogDebug("phase 2: anonymous remap")
-	if err := AnonymizePayloadMappings(childPid, libPath, trapAddr); err != nil {
-		LogWarn("anonymous remap failed (non-fatal)", "error", err)
-	}
-
-	LogDebug("phase 3: linker scrub")
-	if err := ScrubLinkerArtifacts(childPid, libPath); err != nil {
-		LogWarn("linker scrub failed (non-fatal)", "error", err)
-	}
-
-	LogInfo("post-injection stealth sequence complete")
 }

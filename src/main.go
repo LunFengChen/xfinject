@@ -15,8 +15,7 @@ func main() {
 	pkgName := flag.String("pkg", "pkg", "target package name (e.g. com.termux)")
 	libPath := flag.String("lib", "lib", "path to native library to inject")
 	debug := flag.Bool("debug", false, "enable debug logging")
-	stealth := flag.Bool("stealth", false, "enable ephemeral payload delivery (ghost mode)")
-	memfd := flag.Bool("memfd", false, "use memfd_create for fileless injection (maximum stealth)")
+	memfd := flag.Bool("memfd", false, "use memfd_create for fileless injection (requires kernel support)")
 	logcat := flag.Bool("logcat", false, "start logcat for child pid after inject")
 
 	flag.Parse()
@@ -59,35 +58,22 @@ func main() {
 		LogInfo("resolved main activity", "package", *pkgName, "activity", mainActivity)
 	}
 
-	// Step 4: Choose injection mode and execute
+	// Step 4: Inject via selected path
 	var childPid int
 
 	if *memfd {
-		// Maximum stealth: memfd_create path (no file on disk at any point)
-		LogInfo("using memfd injection mode")
 		childPid, err = RunMemfdInjector(*pkgName, *libPath, zygotePid, mainActivity)
 	} else {
-		// Standard or stealth file-based injection
-		actualLibPath := *libPath
-		stagedPayloadPath := ""
-
-		if *stealth {
-			LogInfo("stealth mode enabled")
-			path, err := stageEphemeralPayload(*pkgName, *libPath)
-			if err != nil {
-				LogError("failed to stage ephemeral payload", "error", err)
-				os.Exit(1)
-			}
-			actualLibPath = path
-			stagedPayloadPath = path
-			LogDebug("staged ephemeral payload", "path", path)
+		// Default: staged file injection.  Copy payload to /data/data/<pkgname>/,
+		// chown to app UID, dlopen from there.  The file persists on disk.
+		stagedPath, err := stageEphemeralPayload(*pkgName, *libPath)
+		if err != nil {
+			LogError("failed to stage ephemeral payload", "error", err)
+			os.Exit(1)
 		}
+		LogDebug("staged ephemeral payload", "path", stagedPath)
 
-		childPid, err = RunInjector(*pkgName, actualLibPath, zygotePid, mainActivity)
-
-		if stagedPayloadPath != "" {
-			cleanupStagedPayload(stagedPayloadPath, err == nil)
-		}
+		childPid, err = RunInjector(*pkgName, stagedPath, zygotePid, mainActivity)
 	}
 
 	if err != nil {
@@ -106,37 +92,45 @@ func main() {
 	}
 }
 
+// stageEphemeralPayload copies the user-supplied payload to /data/data/<pkgname>/
+// with the app's UID so the child process can dlopen it.  The original srcPath is
+// never modified or deleted.
 func stageEphemeralPayload(pkgName string, srcPath string) (string, error) {
+	stagingDir := fmt.Sprintf("/data/data/%s", pkgName)
+
 	payloadData, err := os.ReadFile(srcPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read original payload %q: %w", srcPath, err)
 	}
 
 	randomBytes := make([]byte, 8)
 	if _, err := rand.Read(randomBytes); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to generate random name: %w", err)
 	}
-
-	// Stage into /data/local/tmp with an innocuous name.
-	// This path is universally accessible by the linker's default namespace.
-	// The shellcode will unlink the file immediately after dlopen succeeds,
-	// so it only exists on disk for milliseconds during the injection window.
-	stagingDir := "/data/local/tmp"
 
 	stagedName := fmt.Sprintf(".org.chromium.%s.tmp", hex.EncodeToString(randomBytes))
 	stagedPath := filepath.Join(stagingDir, stagedName)
-	if err := os.WriteFile(stagedPath, payloadData, 0755); err != nil {
-		return "", err
+
+	if err := os.MkdirAll(stagingDir, 0700); err != nil {
+		return "", fmt.Errorf("cannot create staging dir %q: %w", stagingDir, err)
 	}
-	if err := os.Chmod(stagedPath, 0755); err != nil {
-		_ = os.Remove(stagedPath)
-		return "", err
+
+	if err := os.WriteFile(stagedPath, payloadData, 0755); err != nil {
+		return "", fmt.Errorf("failed to write staged payload to %q: %w", stagedPath, err)
+	}
+
+	uid := getAppUid(pkgName)
+	if uid > 0 {
+		if err := os.Chown(stagedPath, uid, -1); err != nil {
+			LogWarn("failed to chown staged payload to app uid", "uid", uid, "error", err)
+		} else {
+			LogDebug("chowned staged payload to app uid", "uid", uid)
+		}
 	}
 
 	return stagedPath, nil
 }
 
-// getAppUid returns the numeric UID for an app's data directory.
 func getAppUid(pkgName string) int {
 	out, err := exec.Command("stat", "-c", "%u", fmt.Sprintf("/data/data/%s", pkgName)).Output()
 	if err != nil {
@@ -145,17 +139,4 @@ func getAppUid(pkgName string) int {
 	var uid int
 	fmt.Sscanf(string(out), "%d", &uid)
 	return uid
-}
-
-func cleanupStagedPayload(path string, logSuccess bool) {
-	if path == "" {
-		return
-	}
-	if err := os.Remove(path); err != nil {
-		LogWarn("failed to unlink ephemeral payload", "path", path, "error", err)
-		return
-	}
-	if logSuccess {
-		LogInfo("unlinked ephemeral payload")
-	}
 }

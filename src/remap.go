@@ -124,7 +124,7 @@ func executeRemapInProcess(pid int, addr, size uint64, prot int, trapAddr uint64
 	}
 
 	// Hijack a thread to execute the stub
-	err = hijackThreadForExecution(pid, trapAddr)
+	err = hijackThreadWithRetry(pid, trapAddr, 10, 200*time.Millisecond)
 	if err != nil {
 		_ = WriteMem(pid, trapAddr, backup)
 		return fmt.Errorf("thread hijack failed: %w", err)
@@ -143,6 +143,27 @@ func executeRemapInProcess(pid int, addr, size uint64, prot int, trapAddr uint64
 
 	_ = WriteMem(pid, trapAddr, backup)
 	return fmt.Errorf("remap mailbox timeout")
+}
+
+func hijackThreadWithRetry(pid int, shellcodeAddr uint64, attempts int, delay time.Duration) error {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if err := hijackThreadForExecution(pid, shellcodeAddr); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if i+1 < attempts {
+			time.Sleep(delay)
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("thread hijack failed")
+	}
+	return lastErr
 }
 
 // hijackThreadForExecution finds a thread blocked in a syscall and patches
@@ -174,48 +195,60 @@ func hijackThreadForExecution(pid int, shellcodeAddr uint64) error {
 			continue
 		}
 
-		// Parse PC (last field)
+		// Parse PC (last field) — on some kernels the resume PC (svc+4),
+		// on others the svc address itself. Handle both conventions.
 		var pc uint64
 		_, err = fmt.Sscanf(fields[len(fields)-1], "0x%x", &pc)
 		if err != nil || pc == 0 {
 			continue
 		}
 
-		// Read the instruction at PC — should be svc #0 (0xd4000001)
-		origInstr, err := ReadMem(pid, pc, 4)
+		// Locate the actual svc instruction by probing PC and PC-4
+		svcPC := uint64(0)
+		for _, candidate := range []uint64{pc - 4, pc} {
+			raw, err := ReadMem(pid, candidate, 4)
+			if err != nil {
+				continue
+			}
+			if binary.LittleEndian.Uint32(raw) == 0xd4000001 {
+				svcPC = candidate
+				break
+			}
+		}
+		if svcPC == 0 {
+			continue
+		}
+		resumePC := svcPC + 4
+
+		origInstr, err := ReadMem(pid, resumePC, 4)
 		if err != nil {
 			continue
 		}
 
-		instr := binary.LittleEndian.Uint32(origInstr)
-		if instr != 0xd4000001 {
-			continue
-		}
-
-		// Calculate branch offset
-		offset := int64(shellcodeAddr) - int64(pc)
+		// Calculate branch offset from resumePC to shellcode
+		offset := int64(shellcodeAddr) - int64(resumePC)
 		if offset%4 != 0 {
 			continue
 		}
 		imm26 := int64(offset / 4)
 		if imm26 > 0x1FFFFFF || imm26 < -0x2000000 {
-			continue // Out of range for B instruction
+			continue
 		}
 
-		// Encode B <shellcodeAddr>
+		// Encode B <shellcodeAddr> and patch the resume point
 		branchInstr := uint32(0x14000000) | uint32(imm26&0x3FFFFFF)
 		buf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(buf, branchInstr)
 
-		if err := WriteMem(pid, pc, buf); err != nil {
+		if err := WriteMem(pid, resumePC, buf); err != nil {
 			continue
 		}
 
-		// Store restore info in the stub's data section
-		_ = WritePointer(pid, shellcodeAddr+0xE0, pc)
-		_ = WriteU32(pid, shellcodeAddr+0xE8, instr)
+		// Store restore info: resume PC and original instruction there
+		_ = WritePointer(pid, shellcodeAddr+0xE0, resumePC)
+		_ = WriteU32(pid, shellcodeAddr+0xE8, binary.LittleEndian.Uint32(origInstr))
 
-		LogDebug("hijacked thread for remap", "tid", tidStr, "pc", pc)
+		LogDebug("hijacked thread", "tid", tidStr, "svcPC", svcPC, "resumePC", resumePC)
 		return nil
 	}
 
