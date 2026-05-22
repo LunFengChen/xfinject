@@ -8,13 +8,12 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 // validZygoteComm returns true if the comm of the process indicates it's
 // the actual zygote, not a forked app that inherited the zygote cmdline.
-// Zygote64's name is "main" (set by prctl PR_SET_NAME). Forked apps show
-// their package name, shells show "sh", etc.
 func validZygoteComm(comm string) bool {
 	switch strings.TrimSpace(comm) {
 	case "main", "zygote64", "zygote":
@@ -23,35 +22,16 @@ func validZygoteComm(comm string) bool {
 	return false
 }
 
+// FindProcessPid scans /proc for a process whose comm matches `processName`
+// (or, as a fallback, whose cmdline contains the name AND whose comm is a
+// recognized zygote variant). Forked apps that inherited zygote's cmdline
+// are filtered out by the comm check. No fork+exec.
 func FindProcessPid(processName string) (int, error) {
-	// Use pgrep -f to find candidates, then verify comm to exclude
-	// shell processes running the pgrep command itself, forked apps that
-	// still show the zygote cmdline, etc.
-	out, err := exec.Command("pgrep", "-f", processName).Output()
-	if err == nil {
-		pids := strings.Fields(string(out))
-		for _, pidStr := range pids {
-			pid, err := strconv.Atoi(pidStr)
-			if err != nil {
-				continue
-			}
-			commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-			if err != nil {
-				continue
-			}
-			if validZygoteComm(string(commData)) {
-				return pid, nil
-			}
-		}
-	}
-
-	// Fallback: scan /proc manually matching both cmdline and comm
-	files, err := os.ReadDir("/proc")
+	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, err
 	}
-
-	for _, f := range files {
+	for _, f := range entries {
 		if !f.IsDir() {
 			continue
 		}
@@ -59,75 +39,65 @@ func FindProcessPid(processName string) (int, error) {
 		if err != nil {
 			continue
 		}
-
-		commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-		if err == nil && validZygoteComm(string(commData)) {
+		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil {
+			continue
+		}
+		if validZygoteComm(string(comm)) {
 			return pid, nil
 		}
-
 		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		if err != nil {
 			continue
 		}
-		s := string(bytes.ReplaceAll(cmdline, []byte{0}, []byte(" ")))
-		if strings.Contains(s, processName) {
-			// Found by cmdline — verify comm isn't a package name
-			commData, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-			if err == nil && !validZygoteComm(string(commData)) {
-				continue // skip forked apps that inherited the cmdline
-			}
+		if strings.Contains(string(bytes.ReplaceAll(cmdline, []byte{0}, []byte(" "))), processName) &&
+			validZygoteComm(string(comm)) {
 			return pid, nil
 		}
 	}
-
 	return 0, fmt.Errorf("process %s not found", processName)
 }
 
-func ForceStopApp(pkgName string) error {
-	cmd := exec.Command("am", "force-stop", pkgName)
-	return cmd.Run()
-}
-
-func FindNewestChildPid(parentPid int, match string, timeout time.Duration) (int, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		out, _ := exec.Command("pgrep", "-P", strconv.Itoa(parentPid)).Output()
-		pids := strings.Fields(string(out))
-
-		for i := len(pids) - 1; i >= 0; i-- {
-			pid, err := strconv.Atoi(pids[i])
-			if err != nil {
-				continue
-			}
-			if match == "" {
-				return pid, nil
-			}
-			cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-			if err != nil {
-				continue
-			}
-			s := string(bytes.ReplaceAll(cmdline, []byte{0}, []byte(" ")))
-			if strings.Contains(s, match) {
-				return pid, nil
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+// ChildrenOf returns the live child pids of `parentPid` by scanning /proc
+// and parsing each process's stat file for its PPid field. PPid lives right
+// after the closing ')' of the (...)-quoted comm. In-process, no fork+exec.
+func ChildrenOf(parentPid int) map[int]bool {
+	result := make(map[int]bool)
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return result
 	}
-
-	return 0, fmt.Errorf("no child of %d matched %q", parentPid, match)
-}
-
-func WaitForProcessExit(pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
-			return true
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
 		}
-		time.Sleep(10 * time.Millisecond)
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue
+		}
+		// Format: "<pid> (<comm>) <state> <ppid> ..."  comm may contain
+		// spaces/parens; the LAST ')' is the comm terminator.
+		i := bytes.LastIndexByte(data, ')')
+		if i < 0 || i+2 >= len(data) {
+			continue
+		}
+		fields := bytes.Fields(data[i+1:])
+		if len(fields) < 2 {
+			continue
+		}
+		ppid, err := strconv.Atoi(string(fields[1]))
+		if err == nil && ppid == parentPid {
+			result[pid] = true
+		}
 	}
-	return false
+	return result
 }
 
+// IsProcessAlive returns true if /proc/<pid> exists.
 func IsProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -136,26 +106,80 @@ func IsProcessAlive(pid int) bool {
 	return err == nil
 }
 
+// ForceStopApp invokes `am force-stop <pkg>` to terminate any running app instance.
+func ForceStopApp(pkgName string) error {
+	return exec.Command("am", "force-stop", pkgName).Run()
+}
+
+// AppProcessAlive returns true iff any process's cmdline starts with `pkgName`
+// (followed by NUL for the main process or ':' for app sub-processes like
+// `pkg:webview`). This is how Android apps name themselves in /proc/<pid>/cmdline
+// after Process.setArgV0.
+func AppProcessAlive(pkgName string) bool {
+	needle := []byte(pkgName)
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%s/cmdline", e.Name()))
+		if err != nil || !bytes.HasPrefix(cmdline, needle) {
+			continue
+		}
+		if len(cmdline) == len(needle) {
+			return true
+		}
+		switch cmdline[len(needle)] {
+		case 0, ':':
+			return true
+		}
+	}
+	return false
+}
+
+// WaitForAppGone polls until no process for pkgName remains, or `timeout`
+// elapses. Returns true if the app exited, false on timeout. Replaces the
+// fixed `time.Sleep` after `am force-stop` — SIGKILL is delivered immediately
+// so the typical loop iteration count is 0–1.
+func WaitForAppGone(pkgName string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	const interval = 10 * time.Millisecond
+	for {
+		if !AppProcessAlive(pkgName) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(interval)
+	}
+}
+
+// ResolveMainActivity returns the canonical launcher activity for a package
+// (component spec `pkg/.Activity`). Tries `cmd package resolve-activity` first,
+// falls back to `pm dump` parsing.
 func ResolveMainActivity(pkgName string) (string, error) {
-	output, err := exec.Command("cmd", "package", "resolve-activity", "--user", "0", pkgName).Output()
-	if err == nil {
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "component=") {
-				parts := strings.Split(line, "component=")
-				if len(parts) > 1 {
-					return strings.Fields(parts[1])[0], nil
+	if out, err := exec.Command("cmd", "package", "resolve-activity", "--user", "0", pkgName).Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if _, after, ok := strings.Cut(line, "component="); ok {
+				if rest := strings.Fields(after); len(rest) > 0 {
+					return rest[0], nil
 				}
 			}
 		}
 	}
 
-	output, err = exec.Command("pm", "dump", pkgName).CombinedOutput()
+	out, err := exec.Command("pm", "dump", pkgName).CombinedOutput()
 	if err != nil {
 		return "", err
 	}
-
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	foundMain := false
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -164,14 +188,51 @@ func ResolveMainActivity(pkgName string) (string, error) {
 			continue
 		}
 		if foundMain && strings.Contains(line, pkgName) {
-			fields := strings.Fields(line)
-			for _, f := range fields {
+			for _, f := range strings.Fields(line) {
 				if strings.Contains(f, "/") {
 					return f, nil
 				}
 			}
 		}
 	}
-
 	return "", fmt.Errorf("could not find main activity for %s", pkgName)
+}
+
+// GetAppUID returns the uid that owns /data/data/<pkg>. Zero on failure.
+func GetAppUID(pkgName string) int {
+	var st syscall.Stat_t
+	if err := syscall.Stat(fmt.Sprintf("/data/data/%s", pkgName), &st); err != nil {
+		return 0
+	}
+	return int(st.Uid)
+}
+
+// GetAndroidAPILevel reads ro.build.version.sdk straight from /system/build.prop.
+// Cached on first call; falls back to a reasonable default if the prop is
+// unreadable or malformed.
+var cachedAPILevel int
+
+func GetAndroidAPILevel() int {
+	if cachedAPILevel != 0 {
+		return cachedAPILevel
+	}
+	const (
+		fallback = 33
+		key      = "ro.build.version.sdk="
+	)
+	data, err := os.ReadFile("/system/build.prop")
+	if err != nil {
+		cachedAPILevel = fallback
+		return fallback
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, key); ok {
+			if lvl, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && lvl > 0 {
+				cachedAPILevel = lvl
+				return lvl
+			}
+		}
+	}
+	cachedAPILevel = fallback
+	return fallback
 }

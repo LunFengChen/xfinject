@@ -50,7 +50,6 @@ set_menu({
 		{ "s", "serial", "kv", nil, "ADB device serial" },
 		{ nil, "pkg", "kv", "com.termux", "Target package" },
 		{ nil, "lib", "kv", nil, "Path to library to inject (local)" },
-		{ nil, "memfd", "k", nil, "Use memfd_create for fileless injection (opt-in)" },
 		{ nil, "logcat", "k", nil, "Stream child logcat after injection" },
 		{ nil, "debug", "k", nil, "Enable debug logging" },
 	},
@@ -60,7 +59,6 @@ on_run(function()
 	local pkg = opt.get("pkg")
 	local serial = opt.get("serial")
 	local local_lib = opt.get("lib")
-	local want_memfd = opt.get("memfd")
 	local want_logcat = opt.get("logcat")
 	local want_debug = opt.get("debug")
 
@@ -113,7 +111,6 @@ on_run(function()
 	table.insert(run_args, "-c")
 
 	local injector_cmd = remote_injector .. " -pkg " .. pkg .. " -lib " .. remote_lib
-	if want_memfd then injector_cmd = injector_cmd .. " -memfd" end
 	if want_debug then injector_cmd = injector_cmd .. " -debug" end
 	if want_logcat then injector_cmd = injector_cmd .. " -logcat" end
 	table.insert(run_args, '"' .. injector_cmd .. '"')

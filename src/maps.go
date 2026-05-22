@@ -8,6 +8,7 @@ import (
 	"strings"
 )
 
+// MapRange is one entry from /proc/<pid>/maps.
 type MapRange struct {
 	Start uint64
 	End   uint64
@@ -15,9 +16,11 @@ type MapRange struct {
 	Path  string
 }
 
+// ParseMaps reads and parses /proc/<pid>/maps. Hidden VMAs (via /proc/vma_hide)
+// are transparently filtered out by the kernel; callers see what the target
+// process itself would see in /proc/self/maps.
 func ParseMaps(pid int) ([]MapRange, error) {
-	path := fmt.Sprintf("/proc/%d/maps", pid)
-	file, err := os.Open(path)
+	file, err := os.Open(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
 		return nil, err
 	}
@@ -26,63 +29,35 @@ func ParseMaps(pid int) ([]MapRange, error) {
 	var ranges []MapRange
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Fields(line)
+		fields := strings.Fields(scanner.Text())
 		if len(fields) < 5 {
 			continue
 		}
-
-		addrRange := strings.Split(fields[0], "-")
-		if len(addrRange) != 2 {
+		addr := strings.Split(fields[0], "-")
+		if len(addr) != 2 {
 			continue
 		}
-
-		start, _ := strconv.ParseUint(addrRange[0], 16, 64)
-		end, _ := strconv.ParseUint(addrRange[1], 16, 64)
-		perms := fields[1]
-
-		mapPath := ""
+		start, _ := strconv.ParseUint(addr[0], 16, 64)
+		end, _ := strconv.ParseUint(addr[1], 16, 64)
+		path := ""
 		if len(fields) >= 6 {
-			mapPath = fields[5]
+			path = fields[5]
 		}
-
-		ranges = append(ranges, MapRange{
-			Start: start,
-			End:   end,
-			Perms: perms,
-			Path:  mapPath,
-		})
+		ranges = append(ranges, MapRange{Start: start, End: end, Perms: fields[1], Path: path})
 	}
-
 	return ranges, scanner.Err()
 }
 
+// GetModuleBase returns the lowest mapped address of the named module (substring match).
 func GetModuleBase(pid int, moduleName string) (uint64, error) {
 	ranges, err := ParseMaps(pid)
 	if err != nil {
 		return 0, err
 	}
-
 	for _, r := range ranges {
 		if strings.Contains(r.Path, moduleName) {
 			return r.Start, nil
 		}
 	}
-
 	return 0, fmt.Errorf("module %s not found in pid %d", moduleName, pid)
-}
-
-func GetModuleRWSegment(pid int, moduleName string) (uint64, error) {
-	ranges, err := ParseMaps(pid)
-	if err != nil {
-		return 0, err
-	}
-
-	for _, r := range ranges {
-		if strings.Contains(r.Path, moduleName) && strings.Contains(r.Perms, "rw") {
-			return r.Start, nil
-		}
-	}
-
-	return 0, fmt.Errorf("rw segment for %s not found in pid %d", moduleName, pid)
 }

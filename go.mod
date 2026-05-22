@@ -1,4 +1,4 @@
-module gozinject
+module github.com/Arsylk/gozinject
 
 go 1.23
 

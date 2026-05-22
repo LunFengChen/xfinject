@@ -8,83 +8,72 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
 func main() {
-	pkgName := flag.String("pkg", "pkg", "target package name (e.g. com.termux)")
-	libPath := flag.String("lib", "lib", "path to native library to inject")
+	pkgName := flag.String("pkg", "", "target package name (e.g. com.example.app)")
+	libPath := flag.String("lib", "", "path to native library to inject")
 	debug := flag.Bool("debug", false, "enable debug logging")
-	memfd := flag.Bool("memfd", false, "use memfd_create for fileless injection (requires kernel support)")
-	logcat := flag.Bool("logcat", false, "start logcat for child pid after inject")
+	logcat := flag.Bool("logcat", false, "stream logcat for the injected child after dlopen")
 
 	flag.Parse()
-
-	if *debug {
-		SetLogLevel("debug")
-	}
 
 	if *pkgName == "" || *libPath == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
-
-	LogInfo("starting spawn injector", "package", *pkgName, "payload", *libPath)
-
-	// Step 1: Kill existing app instance
-	LogDebug("killing existing app instance", "package", *pkgName)
-	err := ForceStopApp(*pkgName)
-	if err != nil {
-		LogWarn("failed to force-stop app", "error", err)
+	if *debug {
+		if err := SetLogLevel("debug"); err != nil {
+			logger.Error("set log level", "error", err)
+		}
 	}
-	time.Sleep(200 * time.Millisecond)
 
-	// Step 2: Locate zygote64
-	LogDebug("locating zygote64")
+	logger.Info("injector start", "package", *pkgName, "payload", *libPath)
+	apiLevel := GetAndroidAPILevel()
+	logger.Debug("detected android api", "api", apiLevel)
+
+	if AppProcessAlive(*pkgName) {
+		logger.Debug("force-stop", "package", *pkgName)
+		if err := ForceStopApp(*pkgName); err != nil {
+			logger.Warn("force-stop failed", "package", *pkgName, "error", err)
+		}
+		if !WaitForAppGone(*pkgName, 2*time.Second) {
+			logger.Warn("app still alive after force-stop", "package", *pkgName)
+		}
+	}
+
 	zygotePid, err := FindProcessPid("zygote64")
 	if err != nil {
-		LogError("could not find zygote64 pid", "error", err)
+		logger.Error("zygote64 not found", "error", err)
 		os.Exit(1)
 	}
-	LogInfo("found zygote64", "pid", zygotePid)
+	logger.Info("zygote located", "zygote_pid", zygotePid)
 
-	// Step 3: Resolve main activity
-	LogDebug("resolving main activity", "package", *pkgName)
 	mainActivity, err := ResolveMainActivity(*pkgName)
 	if err != nil {
-		LogWarn("could not resolve main activity", "error", err)
+		logger.Warn("resolve activity failed", "package", *pkgName, "error", err)
 		mainActivity = fmt.Sprintf("%s/.MainActivity", *pkgName)
 	} else {
-		LogInfo("resolved main activity", "package", *pkgName, "activity", mainActivity)
+		logger.Info("resolved activity", "package", *pkgName, "activity", mainActivity)
 	}
 
-	// Step 4: Inject via selected path
-	var childPid int
-
-	if *memfd {
-		childPid, err = RunMemfdInjector(*pkgName, *libPath, zygotePid, mainActivity)
-	} else {
-		// Default: staged file injection.  Copy payload to /data/data/<pkgname>/,
-		// chown to app UID, dlopen from there.  The file persists on disk.
-		stagedPath, err := stageEphemeralPayload(*pkgName, *libPath)
-		if err != nil {
-			LogError("failed to stage ephemeral payload", "error", err)
-			os.Exit(1)
-		}
-		LogDebug("staged ephemeral payload", "path", stagedPath)
-
-		childPid, err = RunInjector(*pkgName, stagedPath, zygotePid, mainActivity)
-	}
-
+	stagedPath, err := stagePayloadCopy(*pkgName, *libPath)
 	if err != nil {
-		LogError("injection failed", "error", err)
+		logger.Error("stage payload failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Debug("payload staged", "path", stagedPath)
+
+	childPid, err := RunInjector(*pkgName, stagedPath, zygotePid, mainActivity, apiLevel)
+	if err != nil {
+		logger.Error("injection failed", "error", err)
 		os.Exit(1)
 	}
 
-	LogInfo("injection sequence complete", "pid", childPid)
-
 	if *logcat && childPid > 0 {
-		LogInfo("starting logcat", "pid", childPid)
+		logger.Info("streaming logcat", "child_pid", childPid)
 		cmd := exec.Command("logcat", "-v", "brief", fmt.Sprintf("--pid=%d", childPid))
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -92,51 +81,43 @@ func main() {
 	}
 }
 
-// stageEphemeralPayload copies the user-supplied payload to /data/data/<pkgname>/
-// with the app's UID so the child process can dlopen it.  The original srcPath is
-// never modified or deleted.
-func stageEphemeralPayload(pkgName string, srcPath string) (string, error) {
-	stagingDir := fmt.Sprintf("/data/data/%s", pkgName)
-
-	payloadData, err := os.ReadFile(srcPath)
+// stagePayloadCopy copies the user-supplied payload into a location the target
+// app process can dlopen. Prefers /data/data/<pkg> (DAC-protected, app-owned)
+// and falls back to /data/local/tmp. The copy is chowned to the app uid so
+// the stage's open() inside the child succeeds without selinux contortions.
+// Only the COPY is ever referenced by the stage — the user's source file is
+// never touched.
+func stagePayloadCopy(pkgName string, srcPath string) (string, error) {
+	payload, err := os.ReadFile(srcPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read original payload %q: %w", srcPath, err)
+		return "", fmt.Errorf("read source payload %q: %w", srcPath, err)
 	}
 
-	randomBytes := make([]byte, 8)
-	if _, err := rand.Read(randomBytes); err != nil {
-		return "", fmt.Errorf("failed to generate random name: %w", err)
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return "", fmt.Errorf("random name: %w", err)
 	}
+	name := fmt.Sprintf(".org.chromium.%s.tmp", hex.EncodeToString(rnd[:]))
 
-	stagedName := fmt.Sprintf(".org.chromium.%s.tmp", hex.EncodeToString(randomBytes))
-	stagedPath := filepath.Join(stagingDir, stagedName)
+	uid := GetAppUID(pkgName)
+	dirs := []string{fmt.Sprintf("/data/data/%s", pkgName), "/data/local/tmp"}
 
-	if err := os.MkdirAll(stagingDir, 0700); err != nil {
-		return "", fmt.Errorf("cannot create staging dir %q: %w", stagingDir, err)
-	}
-
-	if err := os.WriteFile(stagedPath, payloadData, 0755); err != nil {
-		return "", fmt.Errorf("failed to write staged payload to %q: %w", stagedPath, err)
-	}
-
-	uid := getAppUid(pkgName)
-	if uid > 0 {
-		if err := os.Chown(stagedPath, uid, -1); err != nil {
-			LogWarn("failed to chown staged payload to app uid", "uid", uid, "error", err)
-		} else {
-			LogDebug("chowned staged payload to app uid", "uid", uid)
+	for _, dir := range dirs {
+		dst := filepath.Join(dir, name)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			logger.Debug("mkdir failed", "path", dir, "error", err)
+			continue
 		}
+		if err := os.WriteFile(dst, payload, 0644); err != nil {
+			logger.Debug("write payload failed", "path", dst, "error", err)
+			continue
+		}
+		if uid > 0 {
+			if err := syscall.Chown(dst, uid, -1); err != nil {
+				logger.Debug("chown failed", "path", dst, "uid", uid, "error", err)
+			}
+		}
+		return dst, nil
 	}
-
-	return stagedPath, nil
-}
-
-func getAppUid(pkgName string) int {
-	out, err := exec.Command("stat", "-c", "%u", fmt.Sprintf("/data/data/%s", pkgName)).Output()
-	if err != nil {
-		return 0
-	}
-	var uid int
-	fmt.Sscanf(string(out), "%d", &uid)
-	return uid
+	return "", fmt.Errorf("all staging directories failed")
 }

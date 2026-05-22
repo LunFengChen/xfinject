@@ -6,26 +6,25 @@ import (
 	"os"
 )
 
+// WriteMem writes data into the target process's address space via /proc/<pid>/mem.
+// Requires PTRACE_MODE_ATTACH_FSCREDS — caller must be root or already attached.
 func WriteMem(pid int, addr uint64, data []byte) error {
-	path := fmt.Sprintf("/proc/%d/mem", pid)
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/mem", pid), os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	_, err = f.WriteAt(data, int64(addr))
 	return err
 }
 
+// ReadMem reads `size` bytes from the target process's address space.
 func ReadMem(pid int, addr uint64, size int) ([]byte, error) {
-	path := fmt.Sprintf("/proc/%d/mem", pid)
-	f, err := os.Open(path)
+	f, err := os.Open(fmt.Sprintf("/proc/%d/mem", pid))
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-
 	data := make([]byte, size)
 	_, err = f.ReadAt(data, int64(addr))
 	return data, err
@@ -59,25 +58,4 @@ func ReadString(pid int, addr uint64, maxLen int) (string, error) {
 		}
 	}
 	return string(data), nil
-}
-
-// ReadU32 reads a 32-bit little-endian value from process memory.
-func ReadU32(pid int, addr uint64) (uint32, error) {
-	data, err := ReadMem(pid, addr, 4)
-	if err != nil {
-		return 0, err
-	}
-	return binary.LittleEndian.Uint32(data), nil
-}
-
-// WriteU32 writes a 32-bit little-endian value to process memory.
-func WriteU32(pid int, addr uint64, val uint32) error {
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, val)
-	return WriteMem(pid, addr, buf)
-}
-
-// ZeroMem writes zeros to a region of process memory.
-func ZeroMem(pid int, addr uint64, size int) error {
-	return WriteMem(pid, addr, make([]byte, size))
 }

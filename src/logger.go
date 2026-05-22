@@ -11,113 +11,84 @@ import (
 	"github.com/muesli/termenv"
 )
 
-var (
-	logger *log.Logger
-	styles *log.Styles
-)
+var logger *log.Logger
 
 // Catppuccin Mocha palette
 const (
-	colOverlay0 = "#6c7086" // dim gray      — debug level, separators
-	colSurface2 = "#585b70" // darker gray   — keys
-	colText     = "#cdd6f4" // base text
+	colOverlay0 = "#6c7086" // debug level, keys
 	colSapphire = "#74c7ec" // info level
-	colYellow   = "#f9e2af" // warn level, paths, files
-	colRed      = "#f38ba8" // error level
-	colPeach    = "#fab387" // addresses / hex values
-	colMauve    = "#cba6f7" // numeric counts, pids
-	colBlue     = "#89b4fa" // type/mode/flag values
-	colGreen    = "#a6e3a1" // symbol names, packages
-	colLavender = "#b4befe" // generic values
-	colTeal     = "#94e2d5" // handles / results
+	colYellow   = "#f9e2af" // warn level, paths
+	colRed      = "#f38ba8" // error level, errors
+	colPeach    = "#fab387" // hex / addresses
+	colMauve    = "#cba6f7" // counts, pids
+	colBlue     = "#89b4fa" // types, modes, flags
+	colGreen    = "#a6e3a1" // names, symbols, packages
+	colLavender = "#b4befe" // default values
+	colText     = "#cdd6f4" // message text
 )
 
 func init() {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 
-	styles = log.DefaultStyles()
-
-	// Level prefixes — bracket symbols, plain ASCII
-	styles.Levels[log.DebugLevel] = lipgloss.NewStyle().
-		SetString("[?]").
-		Foreground(lipgloss.Color(colOverlay0))
-	styles.Levels[log.InfoLevel] = lipgloss.NewStyle().
-		SetString("[+]").
-		Foreground(lipgloss.Color(colSapphire))
-	styles.Levels[log.WarnLevel] = lipgloss.NewStyle().
-		SetString("[!]").
-		Foreground(lipgloss.Color(colYellow))
-	styles.Levels[log.ErrorLevel] = lipgloss.NewStyle().
-		SetString("[x]").
-		Foreground(lipgloss.Color(colRed))
-
-	// Message text
+	styles := log.DefaultStyles()
+	styles.Levels[log.DebugLevel] = lipgloss.NewStyle().SetString("[?]").Foreground(lipgloss.Color(colOverlay0))
+	styles.Levels[log.InfoLevel] = lipgloss.NewStyle().SetString("[+]").Foreground(lipgloss.Color(colSapphire))
+	styles.Levels[log.WarnLevel] = lipgloss.NewStyle().SetString("[!]").Foreground(lipgloss.Color(colYellow))
+	styles.Levels[log.ErrorLevel] = lipgloss.NewStyle().SetString("[x]").Foreground(lipgloss.Color(colRed))
 	styles.Message = lipgloss.NewStyle().Foreground(lipgloss.Color(colText))
-
-	// Key/value base styles
-	styles.Key = lipgloss.NewStyle().Foreground(lipgloss.Color(colSurface2))
+	styles.Key = lipgloss.NewStyle().Foreground(lipgloss.Color(colOverlay0))
 	styles.Value = lipgloss.NewStyle().Foreground(lipgloss.Color(colLavender))
 
-	// --- Per-key value coloring ---
-
-	// Addresses / hex (peach)
+	// Addresses / hex values rendered as 0x%x.
 	hexStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colPeach)).
 		Transform(func(s string) string {
-			if num, err := strconv.ParseUint(s, 0, 64); err == nil {
-				return fmt.Sprintf("0x%x", num)
+			if n, err := strconv.ParseUint(s, 0, 64); err == nil {
+				return "0x" + strconv.FormatUint(n, 16)
 			}
 			return s
 		})
 	for _, k := range []string{
-		"addr", "mmap_addr", "hook_addr", "marker_addr", "dlopen_addr",
-		"mmap_region", "handle", "base", "from", "to", "start", "end",
-		"vaddr", "paddr", "offset", "final_va", "target_pc", "svc_pc",
-		"mailbox", "child_mailbox", "uds_path", "fd", "socket_path",
+		"addr", "base", "end", "handle", "mailbox", "mailbox_off", "offset", "slot", "start", "stage_base", "stage_end", "value",
 	} {
 		styles.Values[k] = hexStyle
 	}
 
-	// Numeric counts / pids (mauve)
+	// Numeric counts / pids.
 	numStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colMauve))
 	for _, k := range []string{
-		"pid", "size", "count", "attempt", "timeout", "child_pid",
-		"idx", "total", "score", "critical", "high", "medium", "low",
+		"api", "candidates", "child_pid", "count", "elapsed_ms", "iterations", "pid", "size", "timeout_ms", "uid", "zygote_pid",
 	} {
 		styles.Values[k] = numStyle
 	}
 
-	// Symbol / name identifiers (green)
+	// Names / symbols / packages.
 	symStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen))
 	for _, k := range []string{
-		"symbol", "hook_func", "marker_var", "name", "sym", "lib",
-		"section", "tag", "sentinel", "package", "cmdline", "activity",
+		"activity", "lib", "package", "symbol",
 	} {
 		styles.Values[k] = symStyle
 	}
 
-	// Paths / files (yellow)
+	// Paths / files.
 	pathStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colYellow))
 	for _, k := range []string{
-		"path", "payload", "file", "target", "outpath", "runpath",
+		"path", "payload", "stage_path",
 	} {
 		styles.Values[k] = pathStyle
 	}
 
-	// Modes / types / flags (blue bold)
+	// Types / modes / flags (bold blue).
 	typeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colBlue)).Bold(true)
 	for _, k := range []string{
-		"type", "mode", "flags", "level", "bind", "severity", "risk",
+		"flags", "level", "mode", "perms", "type",
 	} {
 		styles.Values[k] = typeStyle
 	}
 
-	// Results / handles (teal)
-	for _, k := range []string{"result", "hook_func_resolved", "msg"} {
-		styles.Values[k] = lipgloss.NewStyle().Foreground(lipgloss.Color(colTeal))
-	}
-	// Errors (red)
+	// Errors.
+	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))
 	for _, k := range []string{"error", "reason"} {
-		styles.Values[k] = lipgloss.NewStyle().Foreground(lipgloss.Color(colRed))
+		styles.Values[k] = errStyle
 	}
 
 	logger = log.NewWithOptions(os.Stdout, log.Options{
@@ -129,16 +100,15 @@ func init() {
 	logger.SetLevel(log.InfoLevel)
 }
 
-func LogDebug(msg string, kv ...any) { logger.Debug(msg, kv...) }
-func LogInfo(msg string, kv ...any)  { logger.Info(msg, kv...) }
-func LogWarn(msg string, kv ...any)  { logger.Warn(msg, kv...) }
-func LogError(msg string, kv ...any) { logger.Error(msg, kv...) }
-
+// SetLogLevel maps a string ("debug" | "info" | "warn" | "error") to the
+// underlying log level. Empty string keeps the default (info).
 func SetLogLevel(level string) error {
 	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "":
+		return nil
 	case "debug":
 		logger.SetLevel(log.DebugLevel)
-	case "info", "":
+	case "info":
 		logger.SetLevel(log.InfoLevel)
 	case "warn", "warning":
 		logger.SetLevel(log.WarnLevel)

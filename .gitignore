@@ -21,3 +21,4 @@ Thumbs.db
 # Temporary files
 *.tmp
 mlog.txt
+log.txt
