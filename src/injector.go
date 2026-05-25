@@ -10,22 +10,29 @@ import (
 	"time"
 )
 
+// Bounded waits for the cross-process handshake.  Every loop in RunInjector
+// uses a deadline + short-poll pattern (never a blanket time.Sleep), so these
+// values are upper bounds on legit waiting time — the typical successful
+// injection completes the whole chain in 200–400 ms.
 const (
-	childWaitTimeout  = 10 * time.Second
-	stageWaitTimeout  = 10 * time.Second
-	dlopenWaitTimeout = 10 * time.Second
+	// detectTimeout caps how long we wait for our trap to fire in the target
+	// child AND for the stage to announce itself via the mailbox.  These were
+	// previously two separate timeouts (child-fork wait + stage-mailbox wait),
+	// but the loops were merged into one self-identifying scan (matching by the
+	// stage's own getpid() in the mailbox), so a single deadline is honest.
+	detectTimeout     = 20 * time.Second
+	// dlopenTimeout: time we'll wait for the stage to finish its inline
+	// __loader_dlopen of the payload after we release the spin lock.
+	dlopenTimeout     = 10 * time.Second
+	// stageDoneTimeout: time we'll wait for the stage to write its final
+	// status=3 (about-to-RET) marker so we know the RWX page is no longer
+	// executing before we tear down the soinfo / hide the VMA.
 	stageDoneTimeout  = 1 * time.Second
-	childPollInterval = 5 * time.Millisecond
-	stagePollInterval = 2 * time.Millisecond
+	// pollInterval: cadence of the deadline-bounded polling loops.  2 ms is
+	// short enough to barely add latency to a 200 ms total, cheap enough that
+	// 500 polls/sec of single-pid /proc/mem reads is invisible CPU.
+	pollInterval      = 2 * time.Millisecond
 )
-
-func processCmdlineContains(pid int, match string) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	if err != nil {
-		return false
-	}
-	return bytes.Contains(data, []byte(match))
-}
 
 func uint64Bytes(v uint64) []byte {
 	b := make([]byte, 8)
@@ -71,9 +78,40 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 	}
 	logger.Debug("resolved symbol", "symbol", "setArgV0", "addr", setArgV0Addr, "path", libAndroidPath)
 
+	// Read the pristine bytes from disk and compare against zygote's in-mem
+	// copy.  If they differ, a prior failed run left our stub in place —
+	// restore from disk before doing anything else, otherwise every fork
+	// will hit the stale trap and loop in _orig.
+	setArgV0Off, err := FindSymbolOffset(libAndroidPath, trapSymbol)
+	if err != nil {
+		return 0, fmt.Errorf("resolve trap symbol offset: %w", err)
+	}
+	libAndroidBytes, err := os.ReadFile(libAndroidPath)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", libAndroidPath, err)
+	}
+	if int(setArgV0Off)+CUSTOM_TRAP_SIZE > len(libAndroidBytes) {
+		return 0, fmt.Errorf("trap offset %d+%d exceeds %s size %d",
+			setArgV0Off, CUSTOM_TRAP_SIZE, libAndroidPath, len(libAndroidBytes))
+	}
+	diskBytes := libAndroidBytes[setArgV0Off : int(setArgV0Off)+CUSTOM_TRAP_SIZE]
+
 	origBackup, err := ReadMem(zygotePid, setArgV0Addr, CUSTOM_TRAP_SIZE)
 	if err != nil || len(origBackup) != CUSTOM_TRAP_SIZE {
 		return 0, fmt.Errorf("read trap bytes: len=%d err=%w", len(origBackup), err)
+	}
+	if !bytes.Equal(origBackup, diskBytes) {
+		logger.Warn("zygote setArgV0 differs from on-disk; self-healing before injection",
+			"addr", setArgV0Addr, "size", CUSTOM_TRAP_SIZE)
+		if err := WriteMem(zygotePid, setArgV0Addr, diskBytes); err != nil {
+			return 0, fmt.Errorf("self-heal write: %w", err)
+		}
+		verify, err := ReadMem(zygotePid, setArgV0Addr, CUSTOM_TRAP_SIZE)
+		if err != nil || !bytes.Equal(verify, diskBytes) {
+			return 0, fmt.Errorf("self-heal verify failed: zygote bytes still differ from disk")
+		}
+		logger.Info("zygote self-healed from disk", "addr", setArgV0Addr)
+		origBackup = diskBytes
 	}
 
 	linkerBase, err := GetModuleBase(zygotePid, "linker64")
@@ -92,11 +130,14 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 	if err != nil {
 		return 0, err
 	}
-	stagePath := fmt.Sprintf("/data/local/tmp/.gzs.%d", time.Now().UnixNano())
-	if err := os.WriteFile(stagePath, stageImage, 0755); err != nil {
+	stageName, err := randomChromiumName()
+	if err != nil {
+		return 0, err
+	}
+	stagePath, err := writeIntoAppSandbox(pkgName, stageName, stageImage, 0755, targetUID)
+	if err != nil {
 		return 0, fmt.Errorf("write stage: %w", err)
 	}
-	_ = os.Chown(stagePath, targetUID, -1)
 	defer os.Remove(stagePath)
 	logger.Debug("stage written", "stage_path", stagePath, "size", len(stageImage))
 
@@ -118,76 +159,65 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 			return
 		}
 		if err := WriteMem(zygotePid, setArgV0Addr, origBackup); err != nil {
-			logger.Warn("restore zygote trap failed", "addr", setArgV0Addr, "error", err)
-		} else {
-			logger.Debug("zygote trap restored", "addr", setArgV0Addr)
+			logger.Error("restore zygote trap WRITE failed — stub still installed; next run will self-heal",
+				"addr", setArgV0Addr, "error", err)
+			return
 		}
+		// Verify the write landed.  /proc/<pid>/mem can silently no-op on some
+		// kernels (e.g. when the page is marked unwritable mid-flight), and
+		// leaving the stub in zygote bricks every subsequent fork until reboot.
+		after, err := ReadMem(zygotePid, setArgV0Addr, CUSTOM_TRAP_SIZE)
+		if err != nil {
+			logger.Error("restore zygote trap VERIFY-READ failed",
+				"addr", setArgV0Addr, "error", err)
+			return
+		}
+		if !bytes.Equal(after, origBackup) {
+			logger.Error("restore zygote trap VERIFY MISMATCH — stub still installed; next run will self-heal",
+				"addr", setArgV0Addr)
+			return
+		}
+		logger.Debug("zygote trap restored", "addr", setArgV0Addr)
 		zygoteRestored = true
 	}
 	defer restoreZygote()
 
-	if err := exec.Command("am", "start", "-n", mainActivity).Run(); err != nil {
+	// --activity-clear-task forces a cold respawn even if a stale task record
+	// exists (e.g. from a prior force-stop or failed injection), so zygote
+	// always forks a fresh child for our trap to catch.
+	if err := exec.Command("am", "start", "--activity-clear-task", "-n", mainActivity).Run(); err != nil {
 		return 0, fmt.Errorf("am start %s: %w", mainActivity, err)
 	}
 
-	logger.Info("waiting for child",
-		"package", pkgName,
-		"zygote_pid", zygotePid,
-		"timeout_ms", childWaitTimeout.Milliseconds(),
-	)
-	childDeadline := time.Now().Add(childWaitTimeout)
 	zygoteBase, err := GetModuleBase(zygotePid, "libandroid_runtime.so")
 	if err != nil {
 		return 0, fmt.Errorf("zygote libandroid_runtime base: %w", err)
 	}
 
-	var candidates []int
-	seenCandidates := make(map[int]bool)
-	for time.Now().Before(childDeadline) {
-		for pid := range ChildrenOf(zygotePid) {
-			if prevChildren[pid] || seenCandidates[pid] || !IsProcessAlive(pid) {
-				continue
-			}
-			seenCandidates[pid] = true
-			if processCmdlineContains(pid, pkgName) {
-				candidates = append([]int{pid}, candidates...)
-			} else {
-				candidates = append(candidates, pid)
-			}
-		}
-		if len(candidates) > 0 {
-			break
-		}
-		time.Sleep(childPollInterval)
-	}
-	if len(candidates) == 0 {
-		return 0, fmt.Errorf("timeout waiting for child process")
-	}
-	logger.Debug("child candidates", "count", len(candidates))
-
-	// Restore zygote immediately so unrelated forks can't trigger the stub.
-	restoreZygote()
-
-	logger.Info("waiting for stage mailbox",
-		"candidates", len(candidates),
+	// Self-identifying scan: poll all new zygote children, look in each for an
+	// RWX anon region whose mailbox's pid slot matches the candidate's pid and
+	// status >= 1. The stage writes getpid() into the mailbox itself, so the
+	// match is unambiguous — no cmdline guessing, no racy ordering with unrelated
+	// background services that fork from zygote concurrently.
+	detectDeadline := time.Now().Add(detectTimeout)
+	logger.Info("waiting for stage",
+		"package", pkgName,
+		"zygote_pid", zygotePid,
 		"mailbox_off", uint64(DLOPEN_STAGE_MAILBOX_OFF),
-		"timeout_ms", stageWaitTimeout.Milliseconds(),
+		"timeout_ms", detectTimeout.Milliseconds(),
 	)
-	stageDeadline := time.Now().Add(stageWaitTimeout)
 	var childPid int
 	var childMailboxAddr uint64
 	var childSetArgV0Addr uint64
-	for time.Now().Before(stageDeadline) {
-		for _, pid := range candidates {
-			if !IsProcessAlive(pid) {
+	for time.Now().Before(detectDeadline) {
+		for pid := range ChildrenOf(zygotePid) {
+			if prevChildren[pid] || !IsProcessAlive(pid) {
 				continue
 			}
 			ranges, err := ParseMaps(pid)
 			if err != nil {
 				continue
 			}
-			// Single pass over the maps: locate the child's libandroid_runtime
-			// base and any candidate stage RWX mappings simultaneously.
 			var childBase uint64
 			for _, r := range ranges {
 				if childBase == 0 && r.Path != "" && strings.Contains(r.Path, "libandroid_runtime.so") {
@@ -217,10 +247,10 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 		if childPid != 0 {
 			break
 		}
-		time.Sleep(stagePollInterval)
+		time.Sleep(pollInterval)
 	}
 	if childPid == 0 {
-		return 0, fmt.Errorf("stage mailbox timeout")
+		return 0, fmt.Errorf("stage mailbox timeout (no matching child appeared)")
 	}
 	logger.Info("stage ready",
 		"child_pid", childPid,
@@ -252,7 +282,7 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 	// Wait for setArgV0 + dlopen to complete (value >= 2 in the status slot).
 	var handle uint64
 	var observedValue uint64
-	dlopenDeadline := time.Now().Add(dlopenWaitTimeout)
+	dlopenDeadline := time.Now().Add(dlopenTimeout)
 	for time.Now().Before(dlopenDeadline) {
 		if !IsProcessAlive(childPid) {
 			return childPid, fmt.Errorf("child exited before dlopen completion")
@@ -263,7 +293,7 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 			observedValue = binary.LittleEndian.Uint64(val[16:24])
 			break
 		}
-		time.Sleep(stagePollInterval)
+		time.Sleep(pollInterval)
 	}
 	if handle == 0 {
 		logger.Warn("dlopen returned null or timed out — payload may not be loaded",
@@ -289,7 +319,7 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 			stageDoneValue = binary.LittleEndian.Uint64(val)
 			break
 		}
-		time.Sleep(stagePollInterval)
+		time.Sleep(pollInterval)
 	}
 	if stageDoneValue >= 3 {
 		logger.Debug("stage done",

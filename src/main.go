@@ -81,35 +81,19 @@ func main() {
 	}
 }
 
-// stagePayloadCopy copies the user-supplied payload into a location the target
-// app process can dlopen. Prefers /data/data/<pkg> (DAC-protected, app-owned)
-// and falls back to /data/local/tmp. The copy is chowned to the app uid so
-// the stage's open() inside the child succeeds without selinux contortions.
-// Only the COPY is ever referenced by the stage — the user's source file is
-// never touched.
-func stagePayloadCopy(pkgName string, srcPath string) (string, error) {
-	payload, err := os.ReadFile(srcPath)
-	if err != nil {
-		return "", fmt.Errorf("read source payload %q: %w", srcPath, err)
-	}
-
-	var rnd [8]byte
-	if _, err := rand.Read(rnd[:]); err != nil {
-		return "", fmt.Errorf("random name: %w", err)
-	}
-	name := fmt.Sprintf(".org.chromium.%s.tmp", hex.EncodeToString(rnd[:]))
-
-	uid := GetAppUID(pkgName)
-	dirs := []string{fmt.Sprintf("/data/data/%s", pkgName), "/data/local/tmp"}
-
-	for _, dir := range dirs {
+// writeIntoAppSandbox writes data as <name> under the target app's data dir
+// when accessible, falling back to /data/local/tmp. The file is chowned to uid
+// so an open() inside the child's untrusted_app SELinux context succeeds
+// without an audit-visible 'granted' line on app_data_file from a foreign path.
+func writeIntoAppSandbox(pkgName, name string, data []byte, perm os.FileMode, uid int) (string, error) {
+	for _, dir := range []string{fmt.Sprintf("/data/data/%s", pkgName), "/data/local/tmp"} {
 		dst := filepath.Join(dir, name)
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			logger.Debug("mkdir failed", "path", dir, "error", err)
 			continue
 		}
-		if err := os.WriteFile(dst, payload, 0644); err != nil {
-			logger.Debug("write payload failed", "path", dst, "error", err)
+		if err := os.WriteFile(dst, data, perm); err != nil {
+			logger.Debug("write failed", "path", dst, "error", err)
 			continue
 		}
 		if uid > 0 {
@@ -119,5 +103,31 @@ func stagePayloadCopy(pkgName string, srcPath string) (string, error) {
 		}
 		return dst, nil
 	}
-	return "", fmt.Errorf("all staging directories failed")
+	return "", fmt.Errorf("all staging directories failed for %s", name)
+}
+
+// randomChromiumName returns an innocuous chromium-cache-style file name with
+// a fresh 64-bit random suffix.  Used for both the persistent payload copy and
+// the transient stage file so they blend with normal webview artifacts.
+func randomChromiumName() (string, error) {
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return "", fmt.Errorf("random name: %w", err)
+	}
+	return fmt.Sprintf(".org.chromium.%s.tmp", hex.EncodeToString(rnd[:])), nil
+}
+
+// stagePayloadCopy copies the user-supplied payload into the app sandbox so
+// the stage's dlopen() inside the child can open it cleanly.  Only the COPY is
+// ever referenced; the user's source file is never touched.
+func stagePayloadCopy(pkgName string, srcPath string) (string, error) {
+	payload, err := os.ReadFile(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("read source payload %q: %w", srcPath, err)
+	}
+	name, err := randomChromiumName()
+	if err != nil {
+		return "", err
+	}
+	return writeIntoAppSandbox(pkgName, name, payload, 0644, GetAppUID(pkgName))
 }
