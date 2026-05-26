@@ -12,20 +12,50 @@ import (
 	"time"
 )
 
-// validZygoteComm returns true if the comm of the process indicates it's
-// the actual zygote, not a forked app that inherited the zygote cmdline.
-func validZygoteComm(comm string) bool {
-	switch strings.TrimSpace(comm) {
-	case "main", "zygote64", "zygote":
-		return true
+// ppidOf returns the parent pid from /proc/<pid>/stat. The comm field is
+// (...)-quoted and may itself contain spaces or parens, so PPid is the second
+// whitespace field after the LAST ')'.
+func ppidOf(pid int) (int, bool) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
 	}
-	return false
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return 0, false
+	}
+	fields := bytes.Fields(data[i+1:])
+	if len(fields) < 2 {
+		return 0, false
+	}
+	ppid, err := strconv.Atoi(string(fields[1]))
+	if err != nil {
+		return 0, false
+	}
+	return ppid, true
 }
 
-// FindProcessPid scans /proc for a process whose comm matches `processName`
-// (or, as a fallback, whose cmdline contains the name AND whose comm is a
-// recognized zygote variant). Forked apps that inherited zygote's cmdline
-// are filtered out by the comm check. No fork+exec.
+// FindProcessPid scans /proc for the canonical top-level process whose
+// cmdline argv[0] equals `processName` EXACTLY and whose parent is init
+// (PPid == 1).
+//
+// argv[0], NOT comm, is the discriminator: the zygote is app_process, so its
+// /proc/<pid>/comm is "main" — shared by zygote64, the 32-bit zygote, and every
+// freshly forked app. The "zygote64" / "zygote" name only appears in cmdline
+// (set via setArgV0). So:
+//   - Exact argv[0] match keeps zygote64 distinct from the 32-bit `zygote`,
+//     `webview_zygote`, etc. They fork different-ABI children; trapping the
+//     wrong one means our arm64 target never hits the trap and detection times
+//     out.
+//   - PPid == 1 rejects a child that zygote64 just forked but hasn't yet
+//     renamed (it transiently still shows argv[0]=="zygote64"); only the real
+//     zygote is parented to init.
+//
+// Without exactness the winner was just the first comm∈{main,zygote64,zygote}
+// match in /proc order, and os.ReadDir sorts pids lexicographically as strings,
+// so which process won depended on the per-boot PID lottery. That is why
+// injection worked for a whole uptime, then silently targeted the wrong
+// process after a reboot reshuffled the pids. No fork+exec.
 func FindProcessPid(processName string) (int, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -39,23 +69,31 @@ func FindProcessPid(processName string) (int, error) {
 		if err != nil {
 			continue
 		}
-		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-		if err != nil {
-			continue
-		}
-		if validZygoteComm(string(comm)) {
-			return pid, nil
-		}
 		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		if err != nil {
 			continue
 		}
-		if strings.Contains(string(bytes.ReplaceAll(cmdline, []byte{0}, []byte(" "))), processName) &&
-			validZygoteComm(string(comm)) {
-			return pid, nil
+		// argv[0] is the first NUL-delimited token; bytes.Cut returns the whole
+		// slice when there is no NUL.
+		argv0, _, _ := bytes.Cut(cmdline, []byte{0})
+		if string(argv0) != processName {
+			continue
 		}
+		ppid, ok := ppidOf(pid)
+		if !ok {
+			continue
+		}
+		if ppid != 1 {
+			// Right argv[0] but not a child of init: a freshly forked, not-yet-
+			// renamed zygote child, not the real zygote. Logging it makes the
+			// old failure mode (silently trapping the wrong pid) visible.
+			logger.Debug("skip non-init process with matching argv0",
+				"name", processName, "pid", pid, "ppid", ppid)
+			continue
+		}
+		return pid, nil
 	}
-	return 0, fmt.Errorf("process %s not found", processName)
+	return 0, fmt.Errorf("process %s not found (no cmdline argv0=%q child of init)", processName, processName)
 }
 
 // ChildrenOf returns the live child pids of `parentPid` by scanning /proc
@@ -75,22 +113,7 @@ func ChildrenOf(parentPid int) map[int]bool {
 		if err != nil {
 			continue
 		}
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if err != nil {
-			continue
-		}
-		// Format: "<pid> (<comm>) <state> <ppid> ..."  comm may contain
-		// spaces/parens; the LAST ')' is the comm terminator.
-		i := bytes.LastIndexByte(data, ')')
-		if i < 0 || i+2 >= len(data) {
-			continue
-		}
-		fields := bytes.Fields(data[i+1:])
-		if len(fields) < 2 {
-			continue
-		}
-		ppid, err := strconv.Atoi(string(fields[1]))
-		if err == nil && ppid == parentPid {
+		if ppid, ok := ppidOf(pid); ok && ppid == parentPid {
 			result[pid] = true
 		}
 	}
