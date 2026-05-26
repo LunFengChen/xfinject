@@ -218,11 +218,27 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 			if err != nil {
 				continue
 			}
+			// First pass: locate libandroid_runtime.so base. This MUST be a
+			// separate pass from the rwxp scan below: ASLR places the stage's
+			// anonymous region either below or above libandroid_runtime.so, and
+			// the maps are address-sorted. Discovering childBase inline meant
+			// that whenever the stage region sorted first (lower address), the
+			// match was gated on a childBase that was still 0, so the spinning
+			// child was skipped — detection then succeeded or timed out at
+			// random depending on the per-boot ASLR layout.
 			var childBase uint64
 			for _, r := range ranges {
-				if childBase == 0 && r.Path != "" && strings.Contains(r.Path, "libandroid_runtime.so") {
+				if r.Path != "" && strings.Contains(r.Path, "libandroid_runtime.so") {
 					childBase = r.Start
+					break
 				}
+			}
+			if childBase == 0 {
+				continue
+			}
+			// Second pass: find the stage's RWX anonymous region and match the
+			// pid + status it wrote into its mailbox.
+			for _, r := range ranges {
 				if r.Perms != "rwxp" || r.Path != "" || r.End-r.Start < DLOPEN_STAGE_MAILBOX_OFF+32 {
 					continue
 				}
@@ -233,7 +249,7 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 				}
 				pidField := int(binary.LittleEndian.Uint64(val[8:16]))
 				status := binary.LittleEndian.Uint64(val[16:24])
-				if pidField == pid && status >= 1 && childBase != 0 {
+				if pidField == pid && status >= 1 {
 					childPid = pid
 					childMailboxAddr = mb
 					childSetArgV0Addr = childBase + (setArgV0Addr - zygoteBase)
