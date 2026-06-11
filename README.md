@@ -69,8 +69,11 @@ xmake run        ──push──> /data/local/tmp/<lib>.so          (payload)
                                                                           └────────────────────┘
 ```
 
-No `ptrace`. No debugger attach. The hook is a one-shot byte-patch on a single
-function, restored as soon as the target child is spotted.
+The diagram shows the single-payload essence; with several `--lib` payloads the
+stage loads them in order and the injector gates each one (see §3 for the exact
+`gate`/`loaded` mailbox handshake). No `ptrace`. No debugger attach. The hook is a
+one-shot byte-patch on a single function, restored as soon as the target child is
+spotted.
 
 ---
 
@@ -95,7 +98,7 @@ Why not other entry points:
 
 ### 2. Stub + stage architecture
 
-The trap itself is only 428 bytes (`custom_stub.s` → `custom_loader.bin`). Its job:
+The trap itself is only 428 bytes (`custom_stub.s` → `custom_stub.bin`). Its job:
 
 1. Filter — `getpid()` matches zygote, then `getuid()` matches the target app's
    UID, so unrelated forks (`SystemUI`, `system_server` children) fall straight
@@ -122,41 +125,47 @@ restore the child's `setArgV0` page without clobbering still-executing shellcode
 This is the fundamental icache problem that makes "inline" traps unsafe across COW
 restores.
 
-The mailbox is a 32-byte struct at a fixed offset in the stage region, laid out as
-four `uint64` slots:
+The stage loads N payloads (passed via repeated `--lib`, in order) into the one
+trapped child. The mailbox is a 48-byte struct at a fixed offset in the stage
+region, laid out as five `uint64` slots. `gate` (injector → stage) and `loaded`
+(stage → injector) are monotonic counters that gate each payload:
 
-| offset | name    | written by | meaning                                         |
-|--------|---------|------------|-------------------------------------------------|
-| `0x00` | handle  | stage      | dlopen return value                             |
-| `0x08` | pid     | stage      | child's getpid (for cross-check)                |
-| `0x10` | status  | stage      | protocol state — sole shared progress signal    |
-| `0x18` | release | injector   | "go" flag; stage spins on this == 0             |
+| offset | name   | written by | meaning                                              |
+|--------|--------|------------|------------------------------------------------------|
+| `0x00` | handle | stage      | dlopen return value for the payload currently loading |
+| `0x08` | pid    | stage      | child's getpid (for cross-check / self-identification) |
+| `0x10` | status | stage      | `1` = announced & spinning, `3` = stage done (about to RET) |
+| `0x18` | gate   | injector   | `1` releases the single `setArgV0`; `i+2` acks payload `i` |
+| `0x20` | loaded | stage      | `i+1` published once payload `i`'s dlopen has returned |
 
-Sequence inside the stage, with the status state machine:
+Sequence inside the stage:
 
 1. Save the full AArch64 callee-saved set + caller's `x0..x3, x8, x29, x30`.
-2. Write `pid` + `status=1` into the mailbox, then spin on the release slot.
-3. Injector observes status=1, restores the child's `setArgV0` page, writes
-   `release=1`. Stage breaks the spin.
-4. Restore caller args, `BLR` the real `setArgV0` (original bytes are back now).
-5. Call `__loader_dlopen(payload_path, RTLD_NOW, NULL)`. Null caller-addr selects
-   the default namespace.
-6. Write `handle` + `status=2` (dlopen returned).
-7. `unlinkat(AT_FDCWD, payload_path, 0)` — delete the staged copy from disk. The
-   kernel keeps the inode alive through the now-mapped segments.
-8. `madvise(page_align(setArgV0), 8192, MADV_DONTNEED)` — drop the two CoW'd pages
+2. Write `pid` + `status=1` into the mailbox, then spin until `gate >= 1`.
+3. Injector observes `status=1`, restores the child's `setArgV0` page, writes
+   `gate=1`. Stage breaks the spin.
+4. Restore caller args, `BLR` the real `setArgV0` **once** (original bytes are
+   back now).
+5. For each payload `i` in `0..N-1`:
+   a. `__loader_dlopen(path[i], RTLD_NOW, NULL)` (null caller-addr selects the
+      default namespace); write the `handle`.
+   b. `unlinkat(AT_FDCWD, path[i], 0)` — delete the staged copy from disk. The
+      kernel keeps the inode alive through the now-mapped segments.
+   c. Write `loaded=i+1`, then spin until `gate >= i+2` (the injector's ack).
+6. `madvise(page_align(setArgV0), 8192, MADV_DONTNEED)` — drop the two CoW'd pages
    of `libandroid_runtime.so` `.text`. The kernel reverts them to file-backed, so
    smaps `Anonymous` and `Private_Dirty` go back to zero. Works on any kernel since
    2.4 (we target 4.19, pre-`process_madvise`).
-9. Write `status=3` (final state — "stage done, about to RET"). This is the
-   handshake the injector waits for before tearing down the stage region; replaced
-   an earlier 50 ms blanket sleep with a bounded poll.
-10. Restore all callee-saved + caller registers, `RET` to the original `setArgV0`
-    call site. Stage page is no longer executing after this.
+7. Write `status=3` ("stage done, about to RET") — the handshake the injector waits
+   for before hiding the stage region — then restore all registers and `RET` to the
+   original `setArgV0` call site. The stage page is no longer executing after this.
 
-In practice the stage's tail (steps 6–9) is so fast (~100 µs) that the injector
-typically observes status=3 directly without ever sampling status=2 — both mean
-"dlopen returned with a valid handle, safe to proceed".
+The injector side mirrors the loop: it releases `gate=1`, then for each payload
+waits for `loaded >= i+1`, records the handle, and acks `gate=i+2`. The
+handle slot stays stable between those two because the stage blocks on the ack
+before overwriting it. The soinfo-unlink + VMA-hide teardown (§5) is deferred until
+**after** every payload is loaded — unlinking a soinfo that is the linker's solist
+tail would dangle the linker's tail pointer and orphan the next payload's node.
 
 ### 4. CoW-page restoration to byte-identity
 
@@ -193,7 +202,11 @@ After unlink, `dl_iterate_phdr` yields no entry for the payload.
 ### 6. `/proc/maps` hiding via per-UID `vma_hide`
 
 This needs a custom kernel module exposing `/proc/vma_hide` with a per-UID hide list.
-Write commands:
+It is **optional**: `--vma-hide` selects `auto` (the default — use the module iff
+`/proc/vma_hide` exists), `always` (use it; warn, don't abort, if writes fail), or
+`never` (skip it entirely). When inactive, the payload's VMAs are simply left visible
+in `/proc/<pid>/maps`; everything else — soinfo unlinking, on-disk cleanup, CoW
+restoration — is independent of the module and still runs. Write commands:
 
 ```
 clear           # global wipe (all UIDs)
@@ -265,7 +278,7 @@ src/
 ├── utils.go              Process discovery, activity resolution, force-stop, uid
 │                         lookup (syscall.Stat — no exec), API-level detection
 ├── logger.go             Structured logging (catppuccin theme, per-key colors)
-├── custom_loader.bin     428-byte stub binary (embed)
+├── custom_stub.bin       428-byte stub binary (embed)
 └── stage_dlopen.bin      4 KB stage binary (embed)
 
 custom_stub.s             stub source — assemble with aarch64-linux-gnu-as
@@ -273,16 +286,19 @@ stage_dlopen.s            stage source — assemble with aarch64-linux-gnu-as
 xmake.lua                 build + deploy + run task definition
 ```
 
-The `.s` → `.bin` build is **not** wired into `xmake b injector` — the binaries are
-checked in. Rebuild manually after editing:
+The `.bin` blobs are checked in (they are `//go:embed`-ed), but they can no longer
+silently drift from the `.s` sources: `xmake b injector` reassembles each `.s` and
+**fails the build** if it no longer matches the committed `.bin`. After editing a
+source, regenerate the binaries with:
 
 ```bash
-aarch64-linux-gnu-as custom_stub.s   -o /tmp/s.o && aarch64-linux-gnu-objcopy -O binary /tmp/s.o src/custom_loader.bin
-aarch64-linux-gnu-as stage_dlopen.s  -o /tmp/s.o && aarch64-linux-gnu-objcopy -O binary /tmp/s.o src/stage_dlopen.bin
+xmake stubgen            # reassembles custom_stub.s / stage_dlopen.s → src/*.bin
 ```
 
-If you change offsets, update the `STUB_*_OFF` / `DLOPEN_STAGE_*_OFF` constants in
-`shellcode_builder.go` to match the new disassembly.
+(The guard and `stubgen` need `binutils-aarch64-linux-gnu`; without it the guard
+is skipped so a Go-only environment still builds, and CI with binutils enforces
+it.) If you change offsets, also update the `STUB_*_OFF` / `DLOPEN_STAGE_*_OFF`
+constants in `shellcode_builder.go` to match the new disassembly.
 
 ---
 
@@ -310,39 +326,56 @@ xmake b injector       # → dist/injector  (android/arm64, stripped, no CGo)
 # Inject libfoo.so into com.example.app
 xmake run --pkg=com.example.app --lib=/path/to/libfoo.so
 
+# Inject several payloads, in the given order (comma-separated)
+xmake run --pkg=com.example.app --lib=/path/to/libfoo.so,/path/to/libbar.so
+
 # With debug logs
 xmake run --pkg=com.example.app --lib=/path/to/libfoo.so --debug
 
-# With logcat of the injected child after dlopen
+# Stream the injected child's logcat after dlopen (Ctrl-C, or the child exiting,
+# stops the stream and tears the app down with it)
 xmake run --pkg=com.example.app --lib=/path/to/libfoo.so --logcat
+
+# Stream only specific tags, raw format (implies --logcat). Repeat --logtag to
+# whitelist more than one tag (exact-tag filterspec, not regex)
+xmake run --pkg=com.example.app --lib=/path/to/libfoo.so --logtag=MyTag --logtag=OtherTag
+
+# Control the /proc/vma_hide kernel module: auto (default; use it iff present) |
+# always | never
+xmake run --pkg=com.example.app --lib=/path/to/libfoo.so --vma-hide=never
 
 # Specific device
 xmake run -s <serial> --pkg=com.example.app --lib=/path/to/libfoo.so
 ```
 
-The xmake task pushes injector + payload to `/data/local/tmp`, runs the injector
-under `su`, then removes both files. The injector itself handles the rest.
+The xmake task pushes injector + payload(s) to `/data/local/tmp`, runs the injector
+under `su`, then removes the files. The injector itself handles the rest. The
+underlying binary takes a repeatable `-lib` (one per payload); the xmake task
+accepts them comma-separated and expands them.
 
 ### Sample output (info level)
 
 ```
-[+] injector start package=com.example.app payload=/data/local/tmp/libfoo.so
+[+] injector start package=com.example.app payloads=2
+[+] vma_hide mode=auto active=true
 [+] zygote located zygote_pid=1012
 [+] resolved activity package=com.example.app activity=com.example.app/.MainActivity
 [+] stage injector start package=com.example.app api=36
 [+] install trap addr=0x7f0b804f18 size=428
-[+] waiting for child package=com.example.app zygote_pid=1012 timeout_ms=10000
-[+] waiting for stage mailbox candidates=1 mailbox_off=0x188 timeout_ms=10000
-[+] stage ready child_pid=23761 mailbox=0x7f1840d188 value=0x1
-[+] dlopen complete mailbox=0x7f1840d188 value=0x3 handle=0x52bdfee21f1aa963
-[+] payload vmas hidden count=7 base=0x7be16f4000 end=0x7be2581000
+[+] waiting for stage package=com.example.app zygote_pid=1012 mailbox_off=0x140 timeout_ms=20000
+[+] stage ready child_pid=23761 mailbox=0x7f1840d140 value=0x1
+[+] dlopen complete index=0 payload=/data/data/com.example.app/.org.chromium.8f41c3132b9d3df9.tmp handle=0x52bdfee21f1aa963
+[+] dlopen complete index=1 payload=/data/data/com.example.app/.org.chromium.1b7c0a9e44d5e210.tmp handle=0x10ca5b8930a6eff7
+[+] payload vmas hidden count=5 base=0x7be16f4000 end=0x7be2581000
 [+] soinfo unlinked path=/data/data/com.example.app/.org.chromium.8f41c3132b9d3df9.tmp
+[+] payload vmas hidden count=5 base=0x7be25a0000 end=0x7be25a9000
+[+] soinfo unlinked path=/data/data/com.example.app/.org.chromium.1b7c0a9e44d5e210.tmp
 [+] stage vma hidden stage_base=0x7f1840d000 stage_end=0x7f1844d000
-[+] cloaked child_pid=23761 handle=0x52bdfee21f1aa963 uid=10511 elapsed_ms=249
+[+] cloaked child_pid=23761 payloads=2 uid=10511 elapsed_ms=249
 ```
 
-The 12-line trace bookends with `injector start` and `cloaked`; every line in
-between is either a milestone (trap installed, child located, dlopen returned) or
+The trace bookends with `injector start` and `cloaked`; every line in between is
+either a milestone (trap installed, child located, dlopen returned per payload) or
 a confirmed hide operation. No magic-number waits remain — every "waiting" is a
 bounded poll on an observable state transition.
 

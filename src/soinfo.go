@@ -86,12 +86,6 @@ func decodeStdString(pid int, addr uint64) (string, error) {
 	return string(strData[1 : 1+length]), nil
 }
 
-type SoinfoVmaInfo struct {
-	Addr uint64 // soinfo node address
-	Base uint64 // load address (page-aligned, first VMA start)
-	End  uint64 // last mapped byte+1 (last VMA end)
-}
-
 type payloadVmaRange struct {
 	Start uint64
 	End   uint64
@@ -158,22 +152,75 @@ func findPayloadVmaRanges(pid int, payloadPath string) ([]payloadVmaRange, error
 	return result, nil
 }
 
+// vmaHideProcPath is the kernel module's control file. Its presence is what the
+// "auto" mode autodetects.
+const vmaHideProcPath = "/proc/vma_hide"
+
+// vmaHideActive gates every /proc/vma_hide interaction. Resolved once at startup
+// by SetVmaHideMode from the --vma-hide flag. When false, hideVma and
+// clearHiddenVmasForUID are silent no-ops and the injector leaves the payload's
+// VMAs visible in /proc/<pid>/maps (soinfo unlinking still happens — it is
+// independent of the kernel module).
+var vmaHideActive bool
+
+// vmaHideStrict records that the operator passed --vma-hide=always, i.e. demanded
+// hiding rather than best-effort. Under strict mode a hide failure is reported
+// loudly (Error) instead of as an informational degrade, because the operator's
+// stealth assumption no longer holds.
+var vmaHideStrict bool
+
+// VmaHideUsable reports whether /proc/vma_hide hiding is currently active, so
+// callers can skip the work and the (otherwise misleading) "hidden" logging.
+func VmaHideUsable() bool { return vmaHideActive }
+
+// VmaHideStrict reports whether hiding was explicitly demanded (--vma-hide=always),
+// so the caller can treat degraded hiding as an error rather than a soft notice.
+func VmaHideStrict() bool { return vmaHideStrict }
+
+// SetVmaHideMode resolves the --vma-hide mode and records whether the injector
+// will use the kernel module: "never" forces it off, "always" forces it on, and
+// "auto" (the default, also used for an unrecognized value) enables it only when
+// /proc/vma_hide exists. It never fails — under "always" with the module absent,
+// the later writes just warn rather than aborting the injection.
+func SetVmaHideMode(mode string) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "never":
+		vmaHideActive = false
+		logger.Info("vma_hide", "mode", "never", "active", false)
+	case "always":
+		vmaHideActive = true
+		vmaHideStrict = true
+		logger.Info("vma_hide", "mode", "always", "active", true)
+	default: // "auto" (and any unexpected value)
+		if mode != "" && mode != "auto" {
+			logger.Warn("unknown --vma-hide value, falling back to auto", "value", mode)
+		}
+		_, err := os.Stat(vmaHideProcPath)
+		vmaHideActive = err == nil
+		logger.Info("vma_hide", "mode", "auto", "active", vmaHideActive)
+	}
+}
+
 // hideVma adds a per-UID hide entry to /proc/vma_hide. The kernel module
 // filters this range out of /proc/<pid>/maps and /proc/<pid>/smaps for any
 // process running as `uid`. Root (uid 0) is never filtered, so the injector
-// itself still sees the live mapping.
+// itself still sees the live mapping. A no-op (returns nil) when vma_hide is
+// inactive, so it never touches the file under --vma-hide=never.
 //
 // The wildcard "add 0x<s> 0x<e>" form (no uid) is kept by the kernel for
 // backward compatibility, but every gozinject call uses the explicit-uid
 // form so concurrent injections into different apps don't trample.
 func hideVma(uid int, base uint64, end uint64) error {
-	f, err := os.OpenFile("/proc/vma_hide", os.O_WRONLY, 0)
+	if !vmaHideActive {
+		return nil
+	}
+	f, err := os.OpenFile(vmaHideProcPath, os.O_WRONLY, 0)
 	if err != nil {
-		return fmt.Errorf("open /proc/vma_hide: %w", err)
+		return fmt.Errorf("open %s: %w", vmaHideProcPath, err)
 	}
 	defer f.Close()
 	if _, err = fmt.Fprintf(f, "add %d 0x%x 0x%x\n", uid, base, end); err != nil {
-		return fmt.Errorf("write /proc/vma_hide: %w", err)
+		return fmt.Errorf("write %s: %w", vmaHideProcPath, err)
 	}
 	return nil
 }
@@ -183,29 +230,53 @@ func hideVma(uid int, base uint64, end uint64) error {
 // run into the same app don't shadow the new run's mappings. With the new
 // per-UID kernel module this is correctness-optional (the injector reads as
 // root and is never filtered) but still useful for tidiness across multiple
-// injections.
+// injections. A no-op when vma_hide is inactive.
 func clearHiddenVmasForUID(uid int) error {
-	f, err := os.OpenFile("/proc/vma_hide", os.O_WRONLY, 0)
+	if !vmaHideActive {
+		return nil
+	}
+	f, err := os.OpenFile(vmaHideProcPath, os.O_WRONLY, 0)
 	if err != nil {
-		return fmt.Errorf("open /proc/vma_hide: %w", err)
+		return fmt.Errorf("open %s: %w", vmaHideProcPath, err)
 	}
 	defer f.Close()
 	if _, err = fmt.Fprintf(f, "clear %d\n", uid); err != nil {
-		return fmt.Errorf("clear /proc/vma_hide: %w", err)
+		return fmt.Errorf("clear %s: %w", vmaHideProcPath, err)
 	}
 	return nil
+}
+
+// SoinfoHideResult reports what UnlinkSoinfo accomplished for one payload, so the
+// caller can render an accurate terminal status instead of an unconditional
+// "cloaked". VmaActive mirrors whether /proc/vma_hide was in use this run; when
+// false the payload's VMAs are intentionally left visible and VmaRanges/VmaHidden
+// stay zero.
+type SoinfoHideResult struct {
+	Unlinked  bool // soinfo patched out of the linker solist
+	VmaActive bool // /proc/vma_hide in use for this run
+	VmaRanges int  // payload VMA ranges discovered
+	VmaHidden int  // ranges successfully hidden (== VmaRanges on full success)
+}
+
+// FullyHidden reports that every discovered payload VMA was hidden. Trivially
+// false when vma_hide is inactive (the payload is then deliberately visible).
+func (r SoinfoHideResult) FullyHidden() bool {
+	return r.VmaActive && r.VmaRanges > 0 && r.VmaHidden == r.VmaRanges
 }
 
 // UnlinkSoinfo finds the payload on the linker's solist, hides every VMA
 // belonging to it (file-backed segments + linker guard pages + [anon:.bss])
 // from the app's UID via /proc/vma_hide, then patches it out of the linked
-// list so dl_iterate_phdr no longer sees it.
-func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (*SoinfoVmaInfo, error) {
+// list so dl_iterate_phdr no longer sees it. The returned SoinfoHideResult lets
+// the caller report honestly whether hiding fully succeeded; a returned error is
+// a hard failure of the unlink itself (the payload could not be located/patched).
+func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (SoinfoHideResult, error) {
+	res := SoinfoHideResult{VmaActive: vmaHideActive}
 	offsets := GetSoinfoOffsets(apiLevel)
 
 	linkerBase, err := GetModuleBase(pid, "linker64")
 	if err != nil {
-		return nil, fmt.Errorf("linker64 base: %w", err)
+		return res, fmt.Errorf("linker64 base: %w", err)
 	}
 
 	var solistAddr uint64
@@ -220,15 +291,15 @@ func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (*SoinfoVm
 		}
 	}
 	if solistAddr == 0 {
-		return nil, fmt.Errorf("cannot locate solist in linker64")
+		return res, fmt.Errorf("cannot locate solist in linker64")
 	}
 
 	headPtr, err := ReadPointer(pid, solistAddr)
 	if err != nil {
-		return nil, fmt.Errorf("read solist head: %w", err)
+		return res, fmt.Errorf("read solist head: %w", err)
 	}
 	if headPtr == 0 {
-		return nil, fmt.Errorf("solist head is null")
+		return res, fmt.Errorf("solist head is null")
 	}
 
 	logger.Debug("walking solist", "addr", headPtr)
@@ -243,55 +314,61 @@ func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (*SoinfoVm
 		if err == nil && path != "" && strings.Contains(path, payloadPath) {
 			logger.Debug("payload soinfo found", "addr", current, "path", path)
 
-			vmaRanges, err := findPayloadVmaRanges(pid, payloadPath)
-			if err != nil {
-				logger.Warn("find payload VMA ranges failed", "error", err)
+			// VMA hiding is gated on the kernel module; when inactive we skip the
+			// maps scan + hide entirely and only unlink the soinfo from the list.
+			if vmaHideActive {
+				vmaRanges, err := findPayloadVmaRanges(pid, payloadPath)
+				if err != nil {
+					logger.Warn("find payload VMA ranges failed", "error", err)
+				}
+				res.VmaRanges = len(vmaRanges)
+				var vmaBase, vmaEnd uint64
+				hidden := 0
+				for _, vr := range vmaRanges {
+					if vmaBase == 0 || vr.Start < vmaBase {
+						vmaBase = vr.Start
+					}
+					if vr.End > vmaEnd {
+						vmaEnd = vr.End
+					}
+					if err := hideVma(uid, vr.Start, vr.End); err != nil {
+						logger.Warn("vma_hide failed", "start", vr.Start, "end", vr.End, "error", err)
+					} else {
+						logger.Debug("vma hidden", "start", vr.Start, "end", vr.End, "perms", vr.Perms)
+						hidden++
+					}
+				}
+				res.VmaHidden = hidden
+				logger.Info("payload vmas hidden", "count", hidden, "of", res.VmaRanges, "base", vmaBase, "end", vmaEnd)
 			}
-			var vmaBase, vmaEnd uint64
-			hidden := 0
-			for _, vr := range vmaRanges {
-				if vmaBase == 0 || vr.Start < vmaBase {
-					vmaBase = vr.Start
-				}
-				if vr.End > vmaEnd {
-					vmaEnd = vr.End
-				}
-				if err := hideVma(uid, vr.Start, vr.End); err != nil {
-					logger.Warn("vma_hide failed", "start", vr.Start, "end", vr.End, "error", err)
-				} else {
-					logger.Debug("vma hidden", "start", vr.Start, "end", vr.End, "perms", vr.Perms)
-					hidden++
-				}
-			}
-			logger.Info("payload vmas hidden", "count", hidden, "base", vmaBase, "end", vmaEnd)
-			vmaInfo := &SoinfoVmaInfo{Addr: current, Base: vmaBase, End: vmaEnd}
 
 			targetNext, err := ReadPointer(pid, current+uint64(offsets.Next))
 			if err != nil {
-				return vmaInfo, fmt.Errorf("read target next: %w", err)
+				return res, fmt.Errorf("read target next: %w", err)
 			}
 			if prevAddr == 0 {
 				if err := WritePointer(pid, solistAddr, targetNext); err != nil {
-					return vmaInfo, fmt.Errorf("patch solist head: %w", err)
+					return res, fmt.Errorf("patch solist head: %w", err)
 				}
 			} else {
 				if err := WritePointer(pid, prevAddr, targetNext); err != nil {
-					return vmaInfo, fmt.Errorf("patch prev->next: %w", err)
+					return res, fmt.Errorf("patch prev->next: %w", err)
 				}
 			}
+			res.Unlinked = true
 			logger.Info("soinfo unlinked", "path", path)
-			return vmaInfo, nil
+			return res, nil
 		}
 
 		prevAddr = current + uint64(offsets.Next)
 		current, err = ReadPointer(pid, prevAddr)
 		if err != nil {
-			return nil, fmt.Errorf("read next pointer at %#x: %w", prevAddr, err)
+			return res, fmt.Errorf("read next pointer at %#x: %w", prevAddr, err)
 		}
 	}
 
 	if iterations >= 512 {
-		return nil, fmt.Errorf("soinfo walk exceeded %d iterations", iterations)
+		return res, fmt.Errorf("soinfo walk exceeded %d iterations", iterations)
 	}
-	return nil, fmt.Errorf("payload %q not in soinfo list", payloadPath)
+	return res, fmt.Errorf("payload %q not in soinfo list", payloadPath)
 }

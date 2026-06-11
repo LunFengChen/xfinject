@@ -56,7 +56,7 @@ func init() {
 	// Numeric counts / pids.
 	numStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colMauve))
 	for _, k := range []string{
-		"api", "candidates", "child_pid", "count", "elapsed_ms", "iterations", "pid", "size", "timeout_ms", "uid", "zygote_pid",
+		"api", "candidates", "child_pid", "count", "elapsed_ms", "index", "iterations", "payloads", "pid", "size", "timeout_ms", "uid", "zygote_pid",
 	} {
 		styles.Values[k] = numStyle
 	}
@@ -64,7 +64,7 @@ func init() {
 	// Names / symbols / packages.
 	symStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen))
 	for _, k := range []string{
-		"activity", "lib", "package", "symbol",
+		"activity", "lib", "package", "symbol", "tag", "tags",
 	} {
 		styles.Values[k] = symStyle
 	}

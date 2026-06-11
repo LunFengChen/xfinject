@@ -35,6 +35,32 @@ func ppidOf(pid int) (int, bool) {
 	return ppid, true
 }
 
+// procStartTime returns the process start time (jiffies since boot) from
+// /proc/<pid>/stat field 22. Like ppidOf, it parses from the LAST ')' so a
+// comm containing spaces/parens can't shift the field offsets. Pairing the
+// start time with the pid distinguishes the original process from a different
+// one the kernel may have assigned the same pid after it exited — so a liveness
+// poll can't be fooled by pid reuse.
+func procStartTime(pid int) (uint64, bool) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return 0, false
+	}
+	fields := bytes.Fields(data[i+1:])
+	if len(fields) < 20 {
+		return 0, false
+	}
+	startTime, err := strconv.ParseUint(string(fields[19]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return startTime, true
+}
+
 // FindProcessPid scans /proc for the canonical top-level process whose
 // cmdline argv[0] equals `processName` EXACTLY and whose parent is init
 // (PPid == 1).

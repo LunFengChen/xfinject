@@ -22,3 +22,9 @@ Thumbs.db
 *.tmp
 mlog.txt
 log.txt
+
+# Local scratch / test-run artifacts (logcat dumps, scratch configs)
+logtext.txt
+input.json
+jnilog.json
+*.log

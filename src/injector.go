@@ -20,18 +20,18 @@ const (
 	// previously two separate timeouts (child-fork wait + stage-mailbox wait),
 	// but the loops were merged into one self-identifying scan (matching by the
 	// stage's own getpid() in the mailbox), so a single deadline is honest.
-	detectTimeout     = 20 * time.Second
-	// dlopenTimeout: time we'll wait for the stage to finish its inline
-	// __loader_dlopen of the payload after we release the spin lock.
-	dlopenTimeout     = 10 * time.Second
+	detectTimeout = 20 * time.Second
+	// dlopenTimeout: per-payload cap on how long we wait for the stage's
+	// __loader_dlopen of one payload to complete after we open its gate.
+	dlopenTimeout = 10 * time.Second
 	// stageDoneTimeout: time we'll wait for the stage to write its final
 	// status=3 (about-to-RET) marker so we know the RWX page is no longer
 	// executing before we tear down the soinfo / hide the VMA.
-	stageDoneTimeout  = 1 * time.Second
+	stageDoneTimeout = 1 * time.Second
 	// pollInterval: cadence of the deadline-bounded polling loops.  2 ms is
 	// short enough to barely add latency to a 200 ms total, cheap enough that
 	// 500 polls/sec of single-pid /proc/mem reads is invisible CPU.
-	pollInterval      = 2 * time.Millisecond
+	pollInterval = 2 * time.Millisecond
 )
 
 func uint64Bytes(v uint64) []byte {
@@ -46,13 +46,16 @@ func uint64Bytes(v uint64) []byte {
 //     branches to it;
 //   - the stage announces itself via a mailbox at a fixed offset inside its
 //     own anonymous RWX mapping, then spins;
-//   - the injector restores the child's setArgV0 page, releases the spin,
-//     waits for status=2 + dlopen handle, then unlinks the payload soinfo
-//     and hides its VMA ranges (plus the stage region) via /proc/vma_hide.
+//   - the injector restores the child's setArgV0 page, releases the spin, then
+//     gates each payload in libPaths (in order): it waits for that payload's
+//     dlopen to complete and acks so the stage advances to the next. Once every
+//     payload is loaded it unlinks each one's soinfo + hides its VMA ranges,
+//     then hides the stage region.
 //
+// libPaths are loaded in the given order into the single trapped child.
 // apiLevel selects the right soinfo struct offsets for the running Android
 // version (resolved at startup via getprop ro.build.version.sdk).
-func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, apiLevel int) (int, error) {
+func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity string, apiLevel int) (int, error) {
 	startedAt := time.Now()
 	logger.Info("stage injector start", "package", pkgName, "api", apiLevel)
 
@@ -126,7 +129,7 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 	dlopenAddr := linkerBase + dlopenOff
 	logger.Debug("resolved symbol", "symbol", "__loader_dlopen", "addr", dlopenAddr, "path", linkerPath)
 
-	stageImage, err := BuildDlopenStageImage(dlopenAddr, setArgV0Addr, libPath)
+	stageImage, err := BuildDlopenStageImage(dlopenAddr, setArgV0Addr, libPaths)
 	if err != nil {
 		return 0, err
 	}
@@ -141,7 +144,7 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 	defer os.Remove(stagePath)
 	logger.Debug("stage written", "stage_path", stagePath, "size", len(stageImage))
 
-	trap, err := BuildCustomLoaderShellcode(zygotePid, setArgV0Addr, stagePath, targetUID)
+	trap, err := BuildStubShellcode(zygotePid, setArgV0Addr, stagePath, targetUID)
 	if err != nil {
 		return 0, err
 	}
@@ -239,7 +242,7 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 			// Second pass: find the stage's RWX anonymous region and match the
 			// pid + status it wrote into its mailbox.
 			for _, r := range ranges {
-				if r.Perms != "rwxp" || r.Path != "" || r.End-r.Start < DLOPEN_STAGE_MAILBOX_OFF+32 {
+				if r.Perms != "rwxp" || r.Path != "" || r.End-r.Start < DLOPEN_STAGE_MAILBOX_OFF+DLOPEN_STAGE_MAILBOX_SIZE {
 					continue
 				}
 				mb := r.Start + DLOPEN_STAGE_MAILBOX_OFF
@@ -284,49 +287,69 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 		"size", len(origBackup),
 	)
 
-	// Release the stage's spin: write 1 to the release slot at mailbox+24.
-	const releaseSlot = 24
-	if err := WriteMem(childPid, childMailboxAddr+releaseSlot, uint64Bytes(1)); err != nil {
-		return childPid, fmt.Errorf("signal stage: %w", err)
-	}
-	logger.Debug("stage signaled",
-		"mailbox", childMailboxAddr,
-		"slot", uint64(releaseSlot),
-		"value", uint64(1),
+	// Mailbox slot layout (see stage_dlopen.s): [0]=handle [8]=pid [16]=status
+	// [24]=gate (injector->stage counter) [32]=loaded (stage->injector counter).
+	const (
+		gateSlot   = 24
+		loadedSlot = 32
 	)
 
-	// Wait for setArgV0 + dlopen to complete (value >= 2 in the status slot).
-	var handle uint64
-	var observedValue uint64
-	dlopenDeadline := time.Now().Add(dlopenTimeout)
-	for time.Now().Before(dlopenDeadline) {
-		if !IsProcessAlive(childPid) {
-			return childPid, fmt.Errorf("child exited before dlopen completion")
-		}
-		val, err := ReadMem(childPid, childMailboxAddr, 24)
-		if err == nil && len(val) == 24 && binary.LittleEndian.Uint64(val[16:24]) >= 2 {
-			handle = binary.LittleEndian.Uint64(val[0:8])
-			observedValue = binary.LittleEndian.Uint64(val[16:24])
-			break
-		}
-		time.Sleep(pollInterval)
+	// Release the stage's single setArgV0 call: gate=1. The child's trap page is
+	// restored, so the stage's BLR now lands on real code.
+	if err := WriteMem(childPid, childMailboxAddr+gateSlot, uint64Bytes(1)); err != nil {
+		return childPid, fmt.Errorf("signal stage: %w", err)
 	}
-	if handle == 0 {
-		logger.Warn("dlopen returned null or timed out — payload may not be loaded",
-			"mailbox", childMailboxAddr,
-		)
-	} else {
-		logger.Info("dlopen complete",
-			"mailbox", childMailboxAddr,
-			"value", observedValue,
-			"handle", handle,
-		)
+	logger.Debug("stage signaled", "mailbox", childMailboxAddr, "slot", uint64(gateSlot), "value", uint64(1))
+
+	// Gated load loop. The stage loads libPaths in order; for each payload i it
+	// publishes loaded>=i+1 once its dlopen returns (handle in the handle slot,
+	// held stable until we ack), then spins for gate>=i+2. We confirm the handle
+	// and ack so the stage advances to payload i+1.
+	//
+	// The soinfo-unlink + VMA-hide teardown is DEFERRED to after every payload is
+	// loaded (below). Unlinking a soinfo that happens to be the linker's solist
+	// tail leaves the linker's internal tail pointer dangling at the orphaned
+	// node, so the NEXT dlopen chains its soinfo onto that node and becomes
+	// unreachable from the list head — which silently dropped payload i+1 from
+	// the walk. Tearing everything down only once loading is finished keeps the
+	// chain intact for every payload and matches the original post-stage timing.
+	for i, libPath := range libPaths {
+		var handle uint64
+		gotLoaded := false
+		dlopenDeadline := time.Now().Add(dlopenTimeout)
+		for time.Now().Before(dlopenDeadline) {
+			if !IsProcessAlive(childPid) {
+				return childPid, fmt.Errorf("child exited before dlopen of payload %d (%s)", i, libPath)
+			}
+			val, err := ReadMem(childPid, childMailboxAddr, loadedSlot+8)
+			if err == nil && len(val) == loadedSlot+8 &&
+				binary.LittleEndian.Uint64(val[loadedSlot:loadedSlot+8]) >= uint64(i+1) {
+				handle = binary.LittleEndian.Uint64(val[0:8])
+				gotLoaded = true
+				break
+			}
+			time.Sleep(pollInterval)
+		}
+		if !gotLoaded {
+			logger.Warn("dlopen wait timed out — payload may not be loaded",
+				"index", i, "payload", libPath, "mailbox", childMailboxAddr)
+		} else if handle == 0 {
+			logger.Warn("dlopen returned null — payload not loaded", "index", i, "payload", libPath)
+		} else {
+			logger.Info("dlopen complete", "index", i, "payload", libPath, "handle", handle)
+		}
+
+		// Ack payload i: gate=i+2 releases the stage to the next payload (or, for
+		// the last one, to its final madvise + status=3 + RET).
+		if err := WriteMem(childPid, childMailboxAddr+gateSlot, uint64Bytes(uint64(i+2))); err != nil {
+			return childPid, fmt.Errorf("ack payload %d: %w", i, err)
+		}
+		logger.Debug("payload acked", "index", i, "slot", uint64(gateSlot), "value", uint64(i+2))
 	}
 
-	// Wait for the stage to finish executing. The stage writes value=3 to
-	// the status slot as its very last action before RET, so once we observe
-	// it, the stage page is no longer running and we can safely tear down
-	// the soinfo / hide the stage VMA. Bounded poll instead of a fixed sleep.
+	// Wait for the stage to finish executing. The stage writes status=3 as its
+	// very last action before RET, so once we observe it the stage page is no
+	// longer running. Bounded poll instead of a fixed sleep.
 	var stageDoneValue uint64
 	stageDoneDeadline := time.Now().Add(stageDoneTimeout)
 	for time.Now().Before(stageDoneDeadline) {
@@ -338,35 +361,81 @@ func RunInjector(pkgName, libPath string, zygotePid int, mainActivity string, ap
 		time.Sleep(pollInterval)
 	}
 	if stageDoneValue >= 3 {
-		logger.Debug("stage done",
-			"mailbox", childMailboxAddr,
-			"value", stageDoneValue,
-		)
+		logger.Debug("stage done", "mailbox", childMailboxAddr, "value", stageDoneValue)
 	} else {
-		logger.Warn("stage done signal not observed",
-			"mailbox", childMailboxAddr,
-		)
-	}
-	if _, err := UnlinkSoinfo(childPid, targetUID, libPath, apiLevel); err != nil {
-		logger.Warn("soinfo unlink failed (non-fatal)", "error", err)
+		logger.Warn("stage done signal not observed", "mailbox", childMailboxAddr)
 	}
 
-	// Hide the stage's 256 KB RWX anonymous region. The stage has already
-	// returned by now; vma_hide only delists the VMA from /proc enumeration,
-	// the pages stay mapped.
-	stageBase := childMailboxAddr - DLOPEN_STAGE_MAILBOX_OFF
-	stageEnd := stageBase + STAGE_REGION_SIZE
-	if err := hideVma(targetUID, stageBase, stageEnd); err != nil {
-		logger.Warn("stage vma_hide failed (non-fatal)", "error", err)
-	} else {
-		logger.Info("stage vma hidden", "stage_base", stageBase, "stage_end", stageEnd)
+	// Per-payload teardown, now that every payload is loaded: unlink each soinfo
+	// from the solist and hide its VMA ranges. UnlinkSoinfo walks from the list
+	// head and re-links prev->next each time, so the remaining payloads stay
+	// reachable regardless of unlink order. Matches by the staged path, unique
+	// per payload.
+	soinfoUnlinked := 0
+	vmaRangesTotal, vmaHiddenTotal := 0, 0
+	for i, libPath := range libPaths {
+		hr, err := UnlinkSoinfo(childPid, targetUID, libPath, apiLevel)
+		if err != nil {
+			logger.Warn("soinfo unlink failed (non-fatal)", "index", i, "payload", libPath, "error", err)
+		}
+		if hr.Unlinked {
+			soinfoUnlinked++
+		}
+		vmaRangesTotal += hr.VmaRanges
+		vmaHiddenTotal += hr.VmaHidden
 	}
 
-	logger.Info("cloaked",
+	// Hide the stage's 256 KB RWX anonymous region (when vma_hide is active). The
+	// stage has already returned by now; vma_hide only delists the VMA from /proc
+	// enumeration, the pages stay mapped.
+	stageHidden := false
+	if VmaHideUsable() {
+		stageBase := childMailboxAddr - DLOPEN_STAGE_MAILBOX_OFF
+		stageEnd := stageBase + STAGE_REGION_SIZE
+		if err := hideVma(targetUID, stageBase, stageEnd); err != nil {
+			logger.Warn("stage vma_hide failed (non-fatal)", "error", err)
+		} else {
+			stageHidden = true
+			logger.Info("stage vma hidden", "stage_base", stageBase, "stage_end", stageEnd)
+		}
+	}
+
+	// Every payload is dlopen'd by now (the mapping persists independently of the
+	// file), so the on-disk sandbox copies are pure forensic residue — remove them.
+	// A crash before this point is covered by the failure-path cleanup in main.go.
+	for _, p := range libPaths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			logger.Debug("staged payload remove failed", "path", p, "error", err)
+		}
+	}
+
+	// Honest terminal status. "cloaked" is reserved for a run where every required
+	// hide step actually succeeded; otherwise we report "loaded" and spell out what
+	// is still visible, so a degraded run is never mistaken for full stealth — and
+	// --vma-hide=never (which hides nothing by design) is never labelled cloaked.
+	allUnlinked := soinfoUnlinked == len(libPaths)
+	payloadsHidden := vmaRangesTotal > 0 && vmaHiddenTotal == vmaRangesTotal
+	fullyHidden := VmaHideUsable() && allUnlinked && payloadsHidden && stageHidden
+	status := []any{
 		"child_pid", childPid,
-		"handle", handle,
+		"payloads", len(libPaths),
 		"uid", targetUID,
+		"soinfo_unlinked", fmt.Sprintf("%d/%d", soinfoUnlinked, len(libPaths)),
+		"vma_hide", VmaHideUsable(),
+		"payload_vmas", fmt.Sprintf("%d/%d", vmaHiddenTotal, vmaRangesTotal),
+		"stage_hidden", stageHidden,
 		"elapsed_ms", time.Since(startedAt).Milliseconds(),
-	)
+	}
+	switch {
+	case fullyHidden:
+		logger.Info("cloaked", status...)
+	case !VmaHideUsable():
+		logger.Info("loaded — vma_hide inactive, payload visible in /proc/maps", status...)
+	case VmaHideStrict():
+		// Operator demanded hiding (--vma-hide=always) but it did not fully take.
+		logger.Error("loaded but NOT fully hidden despite --vma-hide=always", status...)
+	default:
+		logger.Warn("loaded — degraded hiding (partially visible)", status...)
+	}
 	return childPid, nil
 }
