@@ -1,4 +1,4 @@
-# gozinject
+# xfinject
 
 A stealthy Android ARM64 process injector for authorized security testing. No `ptrace`,
 no debugger attach, no persistent fingerprint visible to the injected app.

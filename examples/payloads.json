@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "allow_direct_paths": true,
+  "debug_path_prefixes": [
+    "/data/local/tmp",
+    "/product/lib64/xfinject"
+  ],
+  "payloads": [
+    {
+      "id": "jnilog",
+      "path": "/product/lib64/xfinject/libjnilog.so",
+      "description": "jnitrace:Arsylk/jnilog"
+    }
+  ]
+}

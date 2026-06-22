@@ -1,4 +1,4 @@
-package main
+package xfinject
 
 import (
 	"bytes"
@@ -55,7 +55,7 @@ func uint64Bytes(v uint64) []byte {
 // libPaths are loaded in the given order into the single trapped child.
 // apiLevel selects the right soinfo struct offsets for the running Android
 // version (resolved at startup via getprop ro.build.version.sdk).
-func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity string, apiLevel int) (int, error) {
+func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity string, apiLevel int, launchActivity bool, waitTimeout time.Duration) (int, error) {
 	startedAt := time.Now()
 	logger.Info("stage injector start", "package", pkgName, "api", apiLevel)
 
@@ -185,11 +185,15 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 	}
 	defer restoreZygote()
 
-	// --activity-clear-task forces a cold respawn even if a stale task record
-	// exists (e.g. from a prior force-stop or failed injection), so zygote
-	// always forks a fresh child for our trap to catch.
-	if err := exec.Command("am", "start", "--activity-clear-task", "-n", mainActivity).Run(); err != nil {
-		return 0, fmt.Errorf("am start %s: %w", mainActivity, err)
+	if launchActivity {
+		// --activity-clear-task forces a cold respawn even if a stale task record
+		// exists (e.g. from a prior force-stop or failed injection), so zygote
+		// always forks a fresh child for our trap to catch.
+		if err := exec.Command("am", "start", "--activity-clear-task", "-n", mainActivity).Run(); err != nil {
+			return 0, fmt.Errorf("am start %s: %w", mainActivity, err)
+		}
+	} else {
+		logger.Info("waiting for natural app launch", "package", pkgName)
 	}
 
 	zygoteBase, err := GetModuleBase(zygotePid, "libandroid_runtime.so")
@@ -202,12 +206,15 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 	// status >= 1. The stage writes getpid() into the mailbox itself, so the
 	// match is unambiguous — no cmdline guessing, no racy ordering with unrelated
 	// background services that fork from zygote concurrently.
-	detectDeadline := time.Now().Add(detectTimeout)
+	if waitTimeout <= 0 {
+		waitTimeout = detectTimeout
+	}
+	detectDeadline := time.Now().Add(waitTimeout)
 	logger.Info("waiting for stage",
 		"package", pkgName,
 		"zygote_pid", zygotePid,
 		"mailbox_off", uint64(DLOPEN_STAGE_MAILBOX_OFF),
-		"timeout_ms", detectTimeout.Milliseconds(),
+		"timeout_ms", waitTimeout.Milliseconds(),
 	)
 	var childPid int
 	var childMailboxAddr uint64

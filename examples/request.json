@@ -1,0 +1,13 @@
+{
+  "package": "com.example.app",
+  "payload_ids": ["jnilog-smoke"],
+  "backend": "zygote-trap",
+  "vma_hide": "never",
+  "debug": true,
+  "force_stop": true,
+  "hide": {
+    "enabled": false,
+    "mode": "kpm",
+    "clear_before": true
+  }
+}

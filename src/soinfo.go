@@ -1,4 +1,4 @@
-package main
+package xfinject
 
 import (
 	"fmt"
@@ -208,7 +208,7 @@ func SetVmaHideMode(mode string) {
 // inactive, so it never touches the file under --vma-hide=never.
 //
 // The wildcard "add 0x<s> 0x<e>" form (no uid) is kept by the kernel for
-// backward compatibility, but every gozinject call uses the explicit-uid
+// backward compatibility, but every xfinject call uses the explicit-uid
 // form so concurrent injections into different apps don't trample.
 func hideVma(uid int, base uint64, end uint64) error {
 	if !vmaHideActive {

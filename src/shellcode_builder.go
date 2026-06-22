@@ -1,4 +1,4 @@
-package main
+package xfinject
 
 import (
 	_ "embed"

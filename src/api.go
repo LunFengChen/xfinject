@@ -1,4 +1,4 @@
-package main
+package xfinject
 
 import (
 	"context"
@@ -15,6 +15,19 @@ import (
 	"time"
 )
 
+// Options describes one xfinject run.
+type Options struct {
+	PackageName   string
+	LibPaths      []string
+	Debug         bool
+	Logcat        bool
+	LogTags       []string
+	VmaHide       string
+	ForceStop     bool
+	WaitForLaunch bool
+	WaitTimeout   time.Duration
+}
+
 // stringSlice collects a repeatable string flag into an ordered slice, so
 // `-lib a.so -lib b.so` yields ["a.so", "b.so"] in command-line order.
 type stringSlice []string
@@ -25,64 +38,70 @@ func (s *stringSlice) Set(v string) error {
 	return nil
 }
 
-func main() {
-	pkgName := flag.String("pkg", "", "target package name (e.g. com.example.app)")
-	var libPaths stringSlice
-	flag.Var(&libPaths, "lib", "path to native library to inject (repeatable; injected in order)")
-	debug := flag.Bool("debug", false, "enable debug logging")
-	logcat := flag.Bool("logcat", false, "stream logcat for the injected child after dlopen")
-	var logTags stringSlice
-	flag.Var(&logTags, "logtag", "stream logcat filtered to this tag (raw format; repeatable); implies -logcat")
-	vmaHide := flag.String("vma-hide", "auto", "/proc/vma_hide use: auto (on iff the module is present) | always | never")
+// InjectByPackage is the small library entry point used by wrappers/daemons.
+// It injects libPaths into a freshly-started target package and returns the
+// child pid that loaded the payloads.
+func InjectByPackage(pkgName string, libPaths []string) (int, error) {
+	return Run(Options{
+		PackageName: pkgName,
+		LibPaths:    libPaths,
+		VmaHide:     "auto",
+		ForceStop:   true,
+	})
+}
 
-	flag.Parse()
-
-	if *pkgName == "" || len(libPaths) == 0 {
-		flag.Usage()
-		os.Exit(1)
+// Run executes one injection request. It is intentionally close to the original
+// xfinject CLI flow, but reusable from xfinjectd or c-shared wrappers.
+func Run(opts Options) (int, error) {
+	if opts.PackageName == "" {
+		return 0, fmt.Errorf("package name is required")
 	}
-	if *debug {
+	if len(opts.LibPaths) == 0 {
+		return 0, fmt.Errorf("at least one payload library is required")
+	}
+	if opts.VmaHide == "" {
+		opts.VmaHide = "auto"
+	}
+	if opts.Debug {
 		if err := SetLogLevel("debug"); err != nil {
 			logger.Error("set log level", "error", err)
 		}
 	}
-	SetVmaHideMode(*vmaHide)
+	SetVmaHideMode(opts.VmaHide)
 
-	logger.Info("injector start", "package", *pkgName, "payloads", len(libPaths))
+	logger.Info("xfinject start", "package", opts.PackageName, "payloads", len(opts.LibPaths))
 	apiLevel := GetAndroidAPILevel()
 	logger.Debug("detected android api", "api", apiLevel)
 
-	if AppProcessAlive(*pkgName) {
-		logger.Debug("force-stop", "package", *pkgName)
-		if err := ForceStopApp(*pkgName); err != nil {
-			logger.Warn("force-stop failed", "package", *pkgName, "error", err)
+	if opts.ForceStop && !opts.WaitForLaunch && AppProcessAlive(opts.PackageName) {
+		logger.Debug("force-stop", "package", opts.PackageName)
+		if err := ForceStopApp(opts.PackageName); err != nil {
+			logger.Warn("force-stop failed", "package", opts.PackageName, "error", err)
 		}
-		if !WaitForAppGone(*pkgName, 2*time.Second) {
-			logger.Warn("app still alive after force-stop", "package", *pkgName)
+		if !WaitForAppGone(opts.PackageName, 2*time.Second) {
+			logger.Warn("app still alive after force-stop", "package", opts.PackageName)
 		}
 	}
 
 	zygotePid, err := FindProcessPid("zygote64")
 	if err != nil {
-		logger.Error("zygote64 not found", "error", err)
-		os.Exit(1)
+		return 0, fmt.Errorf("zygote64 not found: %w", err)
 	}
 	logger.Info("zygote located", "zygote_pid", zygotePid)
 
-	mainActivity, err := ResolveMainActivity(*pkgName)
-	if err != nil {
-		logger.Warn("resolve activity failed", "package", *pkgName, "error", err)
-		mainActivity = fmt.Sprintf("%s/.MainActivity", *pkgName)
-	} else {
-		logger.Info("resolved activity", "package", *pkgName, "activity", mainActivity)
+	mainActivity := ""
+	if !opts.WaitForLaunch {
+		var err error
+		mainActivity, err = ResolveMainActivity(opts.PackageName)
+		if err != nil {
+			logger.Warn("resolve activity failed", "package", opts.PackageName, "error", err)
+			mainActivity = fmt.Sprintf("%s/.MainActivity", opts.PackageName)
+		} else {
+			logger.Info("resolved activity", "package", opts.PackageName, "activity", mainActivity)
+		}
 	}
 
-	// Stage one sandbox copy per payload, preserving command-line order so the
-	// stage dlopens them in the same sequence.
-	stagedPaths := make([]string, 0, len(libPaths))
-	// Remove every staged sandbox copy made so far. Used on the failure paths
-	// below — os.Exit does not run defers, so cleanup is explicit. The success
-	// path removes the copies inside RunInjector once every dlopen has completed.
+	stagedPaths := make([]string, 0, len(opts.LibPaths))
 	cleanupStaged := func() {
 		for _, p := range stagedPaths {
 			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
@@ -90,29 +109,99 @@ func main() {
 			}
 		}
 	}
-	for i, libPath := range libPaths {
-		stagedPath, err := stagePayloadCopy(*pkgName, libPath)
+	for i, libPath := range opts.LibPaths {
+		stagedPath, err := stagePayloadCopy(opts.PackageName, libPath)
 		if err != nil {
-			logger.Error("stage payload failed", "index", i, "payload", libPath, "error", err)
 			cleanupStaged()
-			os.Exit(1)
+			return 0, fmt.Errorf("stage payload %d %q: %w", i, libPath, err)
 		}
 		logger.Debug("payload staged", "index", i, "path", stagedPath)
 		stagedPaths = append(stagedPaths, stagedPath)
 	}
 
-	childPid, err := RunInjector(*pkgName, stagedPaths, zygotePid, mainActivity, apiLevel)
+	childPid, err := RunInjector(opts.PackageName, stagedPaths, zygotePid, mainActivity, apiLevel, !opts.WaitForLaunch, opts.WaitTimeout)
 	if err != nil {
-		logger.Error("injection failed", "error", err)
 		cleanupStaged()
-		os.Exit(1)
+		return childPid, err
 	}
 
-	// -logtag implies -logcat: a tag filter still wants the same streaming flow,
-	// so the operator never has to pass both.
-	if (*logcat || len(logTags) > 0) && childPid > 0 {
-		streamLogcat(*pkgName, childPid, logTags)
+	if (opts.Logcat || len(opts.LogTags) > 0) && childPid > 0 {
+		streamLogcat(opts.PackageName, childPid, opts.LogTags)
 	}
+	return childPid, nil
+}
+
+// RunCLI keeps the original command-line UX while allowing the implementation
+// to live in package xfinject.
+func RunCLI(args []string) int {
+	fs := flag.NewFlagSet("xfinjectd", flag.ContinueOnError)
+	pkgName := fs.String("pkg", "", "target package name (e.g. com.example.app)")
+	var libPaths stringSlice
+	fs.Var(&libPaths, "lib", "path to native library to inject (repeatable; injected in order)")
+	debug := fs.Bool("debug", false, "enable debug logging")
+	logcat := fs.Bool("logcat", false, "stream logcat for the injected child after dlopen")
+	var logTags stringSlice
+	fs.Var(&logTags, "logtag", "stream logcat filtered to this tag (raw format; repeatable); implies -logcat")
+	vmaHide := fs.String("vma-hide", "auto", "/proc/vma_hide use: auto (on iff the module is present) | always | never")
+	requestPath := fs.String("request", "", "JSON injection request file (service-mode skeleton)")
+	allowlistPath := fs.String("allowlist", DefaultAllowlistPath, "payload allowlist JSON path used with -request/-watch")
+	watch := fs.Bool("watch", false, "run persistent ROM policy watcher: inject jnilog into running packages with persist.rommgr.app.<pkg>.jnilog_trace=1")
+	watchInterval := fs.Duration("watch-interval", 2*time.Second, "watch mode scan interval")
+	watchPayload := fs.String("watch-payload", "jnilog", "allowlist payload id used by -watch")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *watch {
+		if err := RunWatch(WatchOptions{
+			AllowlistPath: *allowlistPath,
+			Interval:      *watchInterval,
+			PayloadID:     *watchPayload,
+			VmaHide:       *vmaHide,
+			Debug:         *debug,
+		}); err != nil {
+			logger.Error("watch failed", "error", err)
+			return 1
+		}
+		return 0
+	}
+	if *requestPath != "" {
+		data, err := os.ReadFile(*requestPath)
+		if err != nil {
+			logger.Error("read request failed", "path", *requestPath, "error", err)
+			return 1
+		}
+		allow, err := LoadAllowlist(*allowlistPath)
+		if err != nil {
+			logger.Error("load allowlist failed", "path", *allowlistPath, "error", err)
+			return 1
+		}
+		result, err := RunRequestJSON(data, allow)
+		if err != nil {
+			logger.Error("request injection failed", "path", *requestPath, "error", err)
+			return 1
+		}
+		logger.Info("request injection complete", "child_pid", result.ChildPID, "backend", result.Backend, "payloads", len(result.Payloads), "kpm", result.KPM)
+		return 0
+	}
+	if *pkgName == "" || len(libPaths) == 0 {
+		fs.Usage()
+		return 2
+	}
+	_, err := Run(Options{
+		PackageName: *pkgName,
+		LibPaths:    []string(libPaths),
+		Debug:       *debug,
+		Logcat:      *logcat,
+		LogTags:     []string(logTags),
+		VmaHide:     *vmaHide,
+		ForceStop:   true,
+	})
+	if err != nil {
+		logger.Error("injection failed", "error", err)
+		return 1
+	}
+	return 0
 }
 
 // streamLogcat tails logcat for the freshly injected child and blocks until one
