@@ -22,18 +22,19 @@ const (
 // Payloads can be referenced by stable IDs from an allowlist, or by direct paths
 // only when the allowlist explicitly permits debug prefixes.
 type Request struct {
-	PackageName  string      `json:"package"`
-	PayloadID    string      `json:"payload_id,omitempty"`
-	PayloadIDs   []string    `json:"payload_ids,omitempty"`
-	PayloadPath  string      `json:"payload_path,omitempty"`
-	PayloadPaths []string    `json:"payload_paths,omitempty"`
-	Backend      string      `json:"backend,omitempty"`
-	VmaHide      string      `json:"vma_hide,omitempty"`
-	Debug        bool        `json:"debug,omitempty"`
-	Logcat       bool        `json:"logcat,omitempty"`
-	LogTags      []string    `json:"log_tags,omitempty"`
-	ForceStop    *bool       `json:"force_stop,omitempty"`
-	Hide         HideRequest `json:"hide,omitempty"`
+	PackageName   string      `json:"package"`
+	PayloadID     string      `json:"payload_id,omitempty"`
+	PayloadIDs    []string    `json:"payload_ids,omitempty"`
+	PayloadPath   string      `json:"payload_path,omitempty"`
+	PayloadPaths  []string    `json:"payload_paths,omitempty"`
+	Backend       string      `json:"backend,omitempty"`
+	VmaHide       string      `json:"vma_hide,omitempty"`
+	Debug         bool        `json:"debug,omitempty"`
+	Logcat        bool        `json:"logcat,omitempty"`
+	LogTags       []string    `json:"log_tags,omitempty"`
+	ForceStop     *bool       `json:"force_stop,omitempty"`
+	WaitForLaunch bool        `json:"wait_for_launch,omitempty"`
+	Hide          HideRequest `json:"hide,omitempty"`
 }
 
 // HideRequest reserves the service contract for a future KPM/kernel-side maps
@@ -161,13 +162,14 @@ func RunRequest(req Request, allow *Allowlist) (*Result, error) {
 		forceStop = *req.ForceStop
 	}
 	childPid, err := Run(Options{
-		PackageName: req.PackageName,
-		LibPaths:    payloads,
-		Debug:       req.Debug,
-		Logcat:      req.Logcat,
-		LogTags:     req.LogTags,
-		VmaHide:     req.VmaHide,
-		ForceStop:   forceStop,
+		PackageName:   req.PackageName,
+		LibPaths:      payloads,
+		Debug:         req.Debug,
+		Logcat:        req.Logcat,
+		LogTags:       req.LogTags,
+		VmaHide:       req.VmaHide,
+		ForceStop:     forceStop,
+		WaitForLaunch: req.WaitForLaunch,
 	})
 	if err != nil {
 		return nil, err
