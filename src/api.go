@@ -144,26 +144,10 @@ func RunCLI(args []string) int {
 	fs.Var(&logTags, "logtag", "stream logcat filtered to this tag (raw format; repeatable); implies -logcat")
 	vmaHide := fs.String("vma-hide", "auto", "/proc/vma_hide use: auto (on iff the module is present) | always | never")
 	requestPath := fs.String("request", "", "JSON injection request file (service-mode skeleton)")
-	allowlistPath := fs.String("allowlist", DefaultAllowlistPath, "payload allowlist JSON path used with -request/-watch")
-	watch := fs.Bool("watch", false, "run persistent ROM policy watcher: inject jnilog into running packages with persist.rommgr.app.<pkg>.jnilog_trace=1")
-	watchInterval := fs.Duration("watch-interval", 2*time.Second, "watch mode scan interval")
-	watchPayload := fs.String("watch-payload", "jnilog", "allowlist payload id used by -watch")
+	allowlistPath := fs.String("allowlist", DefaultAllowlistPath, "payload allowlist JSON path used with -request")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
-	}
-	if *watch {
-		if err := RunWatch(WatchOptions{
-			AllowlistPath: *allowlistPath,
-			Interval:      *watchInterval,
-			PayloadID:     *watchPayload,
-			VmaHide:       *vmaHide,
-			Debug:         *debug,
-		}); err != nil {
-			logger.Error("watch failed", "error", err)
-			return 1
-		}
-		return 0
 	}
 	if *requestPath != "" {
 		data, err := os.ReadFile(*requestPath)
