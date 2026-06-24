@@ -110,6 +110,8 @@ set_menu({
 		{ nil, "logcat", "k", nil, "Stream child logcat after injection" },
 		{ nil, "logtag", "kv", nil, "Stream child logcat filtered to TAG (raw format); implies --logcat" },
 		{ nil, "vma-hide", "kv", nil, "/proc/vma_hide use: auto (default) | always | never" },
+		{ nil, "autostart-symbol", "kv", nil, "Optional payload symbol to call after dlopen" },
+		{ nil, "autostart-arg", "kv", nil, "Optional string argument for --autostart-symbol" },
 		{ nil, "debug", "k", nil, "Enable debug logging" },
 	},
 })
@@ -121,6 +123,8 @@ on_run(function()
 	local want_logcat = opt.get("logcat")
 	local want_logtag = opt.get("logtag")
 	local want_vma_hide = opt.get("vma-hide")
+	local want_autostart_symbol = opt.get("autostart-symbol")
+	local want_autostart_arg = opt.get("autostart-arg")
 	local want_debug = opt.get("debug")
 
 	-- --lib is comma-separated; injected in the order given.
@@ -193,6 +197,8 @@ on_run(function()
 	if want_logcat then injector_cmd = injector_cmd .. " -logcat" end
 	if want_logtag then injector_cmd = injector_cmd .. " -logtag " .. want_logtag end
 	if want_vma_hide then injector_cmd = injector_cmd .. " -vma-hide " .. want_vma_hide end
+	if want_autostart_symbol then injector_cmd = injector_cmd .. " -autostart-symbol " .. want_autostart_symbol end
+	if want_autostart_arg then injector_cmd = injector_cmd .. " -autostart-arg " .. want_autostart_arg end
 	table.insert(run_args, '"' .. injector_cmd .. '"')
 
 	os.execv("adb", run_args)

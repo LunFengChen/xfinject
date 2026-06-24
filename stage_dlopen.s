@@ -68,8 +68,27 @@ _lib_loop:
     blr  x8
     str  x0, [x20]          // handle (0 on failure)
 
+    // Optional post-dlopen autostart hook. The injector patches
+    // _autostart_symbol/_autostart_arg only when the caller explicitly asks
+    // for it; otherwise the first byte is NUL and this generic stage does
+    // nothing before continuing to the normal unlink/handshake path.
+    cbz  x0, _skip_autostart
+    adr  x1, _autostart_symbol
+    ldrb w9, [x1]
+    cbz  w9, _skip_autostart
+    mov  x25, x0            // save handle
+    mov  x0, x25
+    ldr  x8, _dlsym_slot
+    blr  x8
+    cbz  x0, _skip_autostart
+    mov  x8, x0             // function pointer
+    adr  x0, _autostart_arg  // optional const char* argument
+    blr  x8
+_skip_autostart:
+
     // Unlink the staged copy from disk if dlopen succeeded. The kernel keeps
     // the inode alive via the now-mapped segments.
+    ldr  x0, [x20]
     cbz  x0, _skip_unlink
     mov  x0, #-100          // AT_FDCWD
     mov  x1, x23
@@ -123,6 +142,8 @@ _libs_done:
 .balign 8
 _dlopen_slot:
     .8byte 0
+_dlsym_slot:
+    .8byte 0
 _orig_hook_slot:
     .8byte 0
 _count:
@@ -131,5 +152,9 @@ _mailbox:
     .space 48, 0x00
 _payload_paths:
     .space 128 * 16, 0x00
+_autostart_symbol:
+    .space 128, 0x00
+_autostart_arg:
+    .space 256, 0x00
 
     .space 4096 - (. - _start), 0x00

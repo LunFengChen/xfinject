@@ -54,13 +54,18 @@ const (
 	// Stage data-slot offsets — mirror the labels in stage_dlopen.s. Re-read
 	// these from `aarch64-linux-gnu-nm -n stage.o` whenever the stage source
 	// changes, since editing the code shifts every slot below it.
-	DLOPEN_STAGE_DLOPEN_OFF        = 0x128
-	DLOPEN_STAGE_ORIG_HOOK_OFF     = 0x130
-	DLOPEN_STAGE_COUNT_OFF         = 0x138
-	DLOPEN_STAGE_MAILBOX_OFF       = 0x140
-	DLOPEN_STAGE_MAILBOX_SIZE      = 48
-	DLOPEN_STAGE_PAYLOAD_PATHS_OFF = 0x170
-	DLOPEN_STAGE_PAYLOAD_PATH_SIZE = 128
+	DLOPEN_STAGE_DLOPEN_OFF            = 0x158
+	DLOPEN_STAGE_DLSYM_OFF             = 0x160
+	DLOPEN_STAGE_ORIG_HOOK_OFF         = 0x168
+	DLOPEN_STAGE_COUNT_OFF             = 0x170
+	DLOPEN_STAGE_MAILBOX_OFF           = 0x178
+	DLOPEN_STAGE_MAILBOX_SIZE          = 48
+	DLOPEN_STAGE_PAYLOAD_PATHS_OFF     = 0x1a8
+	DLOPEN_STAGE_PAYLOAD_PATH_SIZE     = 128
+	DLOPEN_STAGE_AUTOSTART_SYMBOL_OFF  = 0x9a8
+	DLOPEN_STAGE_AUTOSTART_SYMBOL_SIZE = 128
+	DLOPEN_STAGE_AUTOSTART_ARG_OFF     = 0xa28
+	DLOPEN_STAGE_AUTOSTART_ARG_SIZE    = 256
 	// DLOPEN_STAGE_MAX_PAYLOADS is the number of 128-byte path slots reserved in
 	// _payload_paths (`.space 128 * 16`). Keep in sync with stage_dlopen.s.
 	DLOPEN_STAGE_MAX_PAYLOADS = 16
@@ -78,7 +83,7 @@ const (
 // BuildDlopenStageImage patches the embedded 4 KB stage with the runtime
 // addresses it needs and the staged payload paths. The stage loads libPaths in
 // order, gating each one through the mailbox; libPaths[0] is loaded first.
-func BuildDlopenStageImage(dlopenAddr, origHookAddr uint64, libPaths []string) ([]byte, error) {
+func BuildDlopenStageImage(dlopenAddr, dlsymAddr, origHookAddr uint64, libPaths []string, autostartSymbol, autostartArg string) ([]byte, error) {
 	if len(stageDlopenBin) != DLOPEN_STAGE_SIZE {
 		return nil, fmt.Errorf("dlopen stage binary size mismatch: got %d want %d", len(stageDlopenBin), DLOPEN_STAGE_SIZE)
 	}
@@ -91,6 +96,7 @@ func BuildDlopenStageImage(dlopenAddr, origHookAddr uint64, libPaths []string) (
 	stage := make([]byte, len(stageDlopenBin))
 	copy(stage, stageDlopenBin)
 	binary.LittleEndian.PutUint64(stage[DLOPEN_STAGE_DLOPEN_OFF:], dlopenAddr)
+	binary.LittleEndian.PutUint64(stage[DLOPEN_STAGE_DLSYM_OFF:], dlsymAddr)
 	binary.LittleEndian.PutUint64(stage[DLOPEN_STAGE_ORIG_HOOK_OFF:], origHookAddr)
 	binary.LittleEndian.PutUint64(stage[DLOPEN_STAGE_COUNT_OFF:], uint64(len(libPaths)))
 	// Lay out one NUL-padded path per fixed-size slot; the stage indexes them as
@@ -102,6 +108,16 @@ func BuildDlopenStageImage(dlopenAddr, origHookAddr uint64, libPaths []string) (
 		}
 		off := DLOPEN_STAGE_PAYLOAD_PATHS_OFF + i*DLOPEN_STAGE_PAYLOAD_PATH_SIZE
 		copy(stage[off:], []byte(libPath))
+	}
+	if autostartSymbol != "" {
+		if len(autostartSymbol)+1 > DLOPEN_STAGE_AUTOSTART_SYMBOL_SIZE {
+			return nil, fmt.Errorf("autostart symbol too long for dlopen stage: %d > %d", len(autostartSymbol), DLOPEN_STAGE_AUTOSTART_SYMBOL_SIZE-1)
+		}
+		copy(stage[DLOPEN_STAGE_AUTOSTART_SYMBOL_OFF:], []byte(autostartSymbol))
+		if len(autostartArg)+1 > DLOPEN_STAGE_AUTOSTART_ARG_SIZE {
+			return nil, fmt.Errorf("autostart arg too long for dlopen stage: %d > %d", len(autostartArg), DLOPEN_STAGE_AUTOSTART_ARG_SIZE-1)
+		}
+		copy(stage[DLOPEN_STAGE_AUTOSTART_ARG_OFF:], []byte(autostartArg))
 	}
 	return stage, nil
 }

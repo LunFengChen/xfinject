@@ -344,6 +344,14 @@ xmake run --pkg=com.example.app --lib=/path/to/libfoo.so --logtag=MyTag --logtag
 # always | never
 xmake run --pkg=com.example.app --lib=/path/to/libfoo.so --vma-hide=never
 
+# Optional post-dlopen autostart hook. The stage calls dlsym(handle, symbol)
+# and invokes int (*)(const char*) with the supplied argument before unlinking
+# the staged payload. This is generic; xfQTrace uses it to call
+# xfqtrace_configure_file_and_start_async(config_path).
+/data/local/tmp/xfinjectd -pkg com.example.app -lib /data/local/tmp/libxfqtrace.so \
+  -autostart-symbol xfqtrace_configure_file_and_start_async \
+  -autostart-arg /data/data/com.example.app/cache/xfqtrace_config.json
+
 # Specific device
 xmake run -s <serial> --pkg=com.example.app --lib=/path/to/libfoo.so
 ```
@@ -362,7 +370,7 @@ accepts them comma-separated and expands them.
 [+] resolved activity package=com.example.app activity=com.example.app/.MainActivity
 [+] stage injector start package=com.example.app api=36
 [+] install trap addr=0x7f0b804f18 size=428
-[+] waiting for stage package=com.example.app zygote_pid=1012 mailbox_off=0x140 timeout_ms=20000
+[+] waiting for stage package=com.example.app zygote_pid=1012 mailbox_off=0x178 timeout_ms=20000
 [+] stage ready child_pid=23761 mailbox=0x7f1840d140 value=0x1
 [+] dlopen complete index=0 payload=/data/data/com.example.app/.org.chromium.8f41c3132b9d3df9.tmp handle=0x52bdfee21f1aa963
 [+] dlopen complete index=1 payload=/data/data/com.example.app/.org.chromium.1b7c0a9e44d5e210.tmp handle=0x10ca5b8930a6eff7

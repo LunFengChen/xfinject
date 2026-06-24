@@ -17,15 +17,17 @@ import (
 
 // Options describes one xfinject run.
 type Options struct {
-	PackageName   string
-	LibPaths      []string
-	Debug         bool
-	Logcat        bool
-	LogTags       []string
-	VmaHide       string
-	ForceStop     bool
-	WaitForLaunch bool
-	WaitTimeout   time.Duration
+	PackageName     string
+	LibPaths        []string
+	Debug           bool
+	Logcat          bool
+	LogTags         []string
+	VmaHide         string
+	ForceStop       bool
+	WaitForLaunch   bool
+	WaitTimeout     time.Duration
+	AutostartSymbol string
+	AutostartArg    string
 }
 
 // stringSlice collects a repeatable string flag into an ordered slice, so
@@ -119,7 +121,7 @@ func Run(opts Options) (int, error) {
 		stagedPaths = append(stagedPaths, stagedPath)
 	}
 
-	childPid, err := RunInjector(opts.PackageName, stagedPaths, zygotePid, mainActivity, apiLevel, !opts.WaitForLaunch, opts.WaitTimeout)
+	childPid, err := RunInjector(opts.PackageName, stagedPaths, zygotePid, mainActivity, apiLevel, !opts.WaitForLaunch, opts.WaitTimeout, opts.AutostartSymbol, opts.AutostartArg)
 	if err != nil {
 		cleanupStaged()
 		return childPid, err
@@ -143,6 +145,8 @@ func RunCLI(args []string) int {
 	var logTags stringSlice
 	fs.Var(&logTags, "logtag", "stream logcat filtered to this tag (raw format; repeatable); implies -logcat")
 	vmaHide := fs.String("vma-hide", "auto", "/proc/vma_hide use: auto (on iff the module is present) | always | never")
+	autostartSymbol := fs.String("autostart-symbol", "", "optional payload symbol to call after dlopen(handle), before unlink")
+	autostartArg := fs.String("autostart-arg", "", "optional string argument passed to -autostart-symbol")
 	requestPath := fs.String("request", "", "JSON injection request file (service-mode skeleton)")
 	allowlistPath := fs.String("allowlist", DefaultAllowlistPath, "payload allowlist JSON path used with -request")
 
@@ -173,13 +177,15 @@ func RunCLI(args []string) int {
 		return 2
 	}
 	_, err := Run(Options{
-		PackageName: *pkgName,
-		LibPaths:    []string(libPaths),
-		Debug:       *debug,
-		Logcat:      *logcat,
-		LogTags:     []string(logTags),
-		VmaHide:     *vmaHide,
-		ForceStop:   true,
+		PackageName:     *pkgName,
+		LibPaths:        []string(libPaths),
+		Debug:           *debug,
+		Logcat:          *logcat,
+		LogTags:         []string(logTags),
+		VmaHide:         *vmaHide,
+		ForceStop:       true,
+		AutostartSymbol: *autostartSymbol,
+		AutostartArg:    *autostartArg,
 	})
 	if err != nil {
 		logger.Error("injection failed", "error", err)

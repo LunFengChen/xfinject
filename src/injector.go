@@ -55,7 +55,7 @@ func uint64Bytes(v uint64) []byte {
 // libPaths are loaded in the given order into the single trapped child.
 // apiLevel selects the right soinfo struct offsets for the running Android
 // version (resolved at startup via getprop ro.build.version.sdk).
-func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity string, apiLevel int, launchActivity bool, waitTimeout time.Duration) (int, error) {
+func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity string, apiLevel int, launchActivity bool, waitTimeout time.Duration, autostartSymbol, autostartArg string) (int, error) {
 	startedAt := time.Now()
 	logger.Info("stage injector start", "package", pkgName, "api", apiLevel)
 
@@ -129,7 +129,22 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 	dlopenAddr := linkerBase + dlopenOff
 	logger.Debug("resolved symbol", "symbol", "__loader_dlopen", "addr", dlopenAddr, "path", linkerPath)
 
-	stageImage, err := BuildDlopenStageImage(dlopenAddr, setArgV0Addr, libPaths)
+	var dlsymAddr uint64
+	if autostartSymbol != "" {
+		dlsymName := "dlsym"
+		dlsymOff, err := FindSymbolOffset(linkerPath, dlsymName)
+		if err != nil {
+			dlsymName = "__loader_dlsym"
+			dlsymOff, err = FindSymbolOffset(linkerPath, dlsymName)
+			if err != nil {
+				return 0, fmt.Errorf("resolve dlsym for autostart: %w", err)
+			}
+		}
+		dlsymAddr = linkerBase + dlsymOff
+		logger.Debug("resolved symbol", "symbol", dlsymName, "addr", dlsymAddr, "path", linkerPath)
+	}
+
+	stageImage, err := BuildDlopenStageImage(dlopenAddr, dlsymAddr, setArgV0Addr, libPaths, autostartSymbol, autostartArg)
 	if err != nil {
 		return 0, err
 	}
