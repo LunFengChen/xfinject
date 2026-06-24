@@ -352,6 +352,10 @@ xmake run --pkg=com.example.app --lib=/path/to/libfoo.so --vma-hide=never
   -autostart-symbol xfqtrace_configure_file_and_start_async \
   -autostart-arg /data/data/com.example.app/cache/xfqtrace_config.json
 
+# Request JSON callers can pass the same autostart fields:
+#   "autostart_symbol": "xfqtrace_configure_file_and_start_async",
+#   "autostart_arg": "/data/data/.../cache/xfqtrace_config.json"
+
 # Specific device
 xmake run -s <serial> --pkg=com.example.app --lib=/path/to/libfoo.so
 ```
