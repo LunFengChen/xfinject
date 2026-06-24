@@ -214,13 +214,47 @@ func WaitForAppGone(pkgName string, timeout time.Duration) bool {
 // (component spec `pkg/.Activity`). Tries `cmd package resolve-activity` first,
 // falls back to `pm dump` parsing.
 func ResolveMainActivity(pkgName string) (string, error) {
+	if out, err := exec.Command("cmd", "package", "resolve-activity", "--brief", "--user", "0", pkgName).Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if line == "" || !strings.Contains(line, "/") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) > 0 && strings.Contains(fields[0], "/") {
+				return fields[0], nil
+			}
+		}
+	}
+
 	if out, err := exec.Command("cmd", "package", "resolve-activity", "--user", "0", pkgName).Output(); err == nil {
+		activityName := ""
+		activityPackage := ""
 		for _, line := range strings.Split(string(out), "\n") {
 			if _, after, ok := strings.Cut(line, "component="); ok {
 				if rest := strings.Fields(after); len(rest) > 0 {
 					return rest[0], nil
 				}
 			}
+			line = strings.TrimSpace(line)
+			if v, ok := strings.CutPrefix(line, "name="); ok {
+				activityName = strings.TrimSpace(v)
+				continue
+			}
+			if v, ok := strings.CutPrefix(line, "packageName="); ok {
+				activityPackage = strings.TrimSpace(v)
+				continue
+			}
+		}
+		if activityName != "" {
+			if activityPackage == "" {
+				activityPackage = pkgName
+			}
+			if strings.HasPrefix(activityName, ".") {
+				return activityPackage + "/" + activityName, nil
+			}
+			return activityPackage + "/" + activityName, nil
 		}
 	}
 

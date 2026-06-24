@@ -280,18 +280,32 @@ func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (SoinfoHid
 	}
 
 	var solistAddr uint64
+	var sonextAddr uint64
 	for _, lpath := range []string{
 		"/system/bin/linker64",
 		"/apex/com.android.runtime/bin/linker64",
 	} {
-		if off, name, err := FindSymbolOffsetPrefix(lpath, "__dl__ZL6solist"); err == nil {
-			solistAddr = linkerBase + off
-			logger.Debug("solist resolved", "symbol", name, "addr", solistAddr, "path", lpath)
+		if solistAddr == 0 {
+			if off, name, err := FindSymbolOffsetPrefix(lpath, "__dl__ZL6solist"); err == nil {
+				solistAddr = linkerBase + off
+				logger.Debug("solist resolved", "symbol", name, "addr", solistAddr, "path", lpath)
+			}
+		}
+		if sonextAddr == 0 {
+			if off, name, err := FindSymbolOffsetPrefix(lpath, "__dl__ZL6sonext"); err == nil {
+				sonextAddr = linkerBase + off
+				logger.Debug("sonext resolved", "symbol", name, "addr", sonextAddr, "path", lpath)
+			}
+		}
+		if solistAddr != 0 && sonextAddr != 0 {
 			break
 		}
 	}
 	if solistAddr == 0 {
 		return res, fmt.Errorf("cannot locate solist in linker64")
+	}
+	if sonextAddr == 0 {
+		logger.Warn("cannot locate sonext in linker64; tail unlink may leave future dlopen entries unreachable")
 	}
 
 	headPtr, err := ReadPointer(pid, solistAddr)
@@ -305,6 +319,7 @@ func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (SoinfoHid
 	logger.Debug("walking solist", "addr", headPtr)
 
 	var prevAddr uint64
+	var prevSoinfo uint64
 	current := headPtr
 	iterations := 0
 	for current != 0 && iterations < 512 {
@@ -346,6 +361,23 @@ func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (SoinfoHid
 			if err != nil {
 				return res, fmt.Errorf("read target next: %w", err)
 			}
+			// bionic keeps both the list head (solist) and the tail pointer
+			// (sonext).  If the payload is currently the tail, only patching
+			// prev->next leaves sonext dangling at the orphaned payload.  A later
+			// app dlopen then appends new soinfos behind that orphan, making them
+			// unreachable from solist; their eventual dlclose aborts with
+			// "soinfo is not in soinfo_list (double unload?)".
+			if sonextAddr != 0 {
+				sonext, err := ReadPointer(pid, sonextAddr)
+				if err != nil {
+					logger.Warn("read sonext failed", "error", err)
+				} else if sonext == current {
+					if err := WritePointer(pid, sonextAddr, prevSoinfo); err != nil {
+						return res, fmt.Errorf("patch sonext tail: %w", err)
+					}
+					logger.Debug("sonext retargeted", "old", current, "new", prevSoinfo)
+				}
+			}
 			if prevAddr == 0 {
 				if err := WritePointer(pid, solistAddr, targetNext); err != nil {
 					return res, fmt.Errorf("patch solist head: %w", err)
@@ -360,6 +392,7 @@ func UnlinkSoinfo(pid int, uid int, payloadPath string, apiLevel int) (SoinfoHid
 			return res, nil
 		}
 
+		prevSoinfo = current
 		prevAddr = current + uint64(offsets.Next)
 		current, err = ReadPointer(pid, prevAddr)
 		if err != nil {
