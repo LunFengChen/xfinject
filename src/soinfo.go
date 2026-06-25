@@ -2,7 +2,6 @@ package xfinject
 
 import (
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -154,9 +153,7 @@ func findPayloadVmaRanges(pid int, payloadPath string) ([]payloadVmaRange, error
 
 // vmaHideProcPath is the kernel module's control file. Its presence is what the
 // "auto" mode autodetects.
-const vmaHideProcPath = "/proc/vma_hide"
-
-// vmaHideActive gates every /proc/vma_hide interaction. Resolved once at startup
+// vmaHideActive gates every xfvmahide KPM interaction. Resolved once at startup
 // by SetVmaHideMode from the --vma-hide flag. When false, hideVma and
 // clearHiddenVmasForUID are silent no-ops and the injector leaves the payload's
 // VMAs visible in /proc/<pid>/maps (soinfo unlinking still happens — it is
@@ -169,7 +166,7 @@ var vmaHideActive bool
 // stealth assumption no longer holds.
 var vmaHideStrict bool
 
-// VmaHideUsable reports whether /proc/vma_hide hiding is currently active, so
+// VmaHideUsable reports whether xfvmahide KPM hiding is currently active, so
 // callers can skip the work and the (otherwise misleading) "hidden" logging.
 func VmaHideUsable() bool { return vmaHideActive }
 
@@ -178,10 +175,10 @@ func VmaHideUsable() bool { return vmaHideActive }
 func VmaHideStrict() bool { return vmaHideStrict }
 
 // SetVmaHideMode resolves the --vma-hide mode and records whether the injector
-// will use the kernel module: "never" forces it off, "always" forces it on, and
-// "auto" (the default, also used for an unrecognized value) enables it only when
-// /proc/vma_hide exists. It never fails — under "always" with the module absent,
-// the later writes just warn rather than aborting the injection.
+// will use xfvmahide: "never" forces it off, "always" forces it on, and
+// "auto" enables it only when KernelPatch is ready and xfvmahide is already loaded.
+// It never fails — under "always" with the module absent, later control calls just
+// warn rather than aborting the injection.
 func SetVmaHideMode(mode string) {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "never":
@@ -191,64 +188,48 @@ func SetVmaHideMode(mode string) {
 		vmaHideActive = true
 		vmaHideStrict = true
 		logger.Info("vma_hide", "mode", "always", "active", true)
-	default: // "auto" (and any unexpected value)
+	default:
 		if mode != "" && mode != "auto" {
 			logger.Warn("unknown --vma-hide value, falling back to auto", "value", mode)
 		}
-		_, err := os.Stat(vmaHideProcPath)
-		vmaHideActive = err == nil
+		vmaHideActive = kpXfvmahideAvailable()
 		logger.Info("vma_hide", "mode", "auto", "active", vmaHideActive)
 	}
 }
 
-// hideVma adds a per-UID hide entry to /proc/vma_hide. The kernel module
-// filters this range out of /proc/<pid>/maps and /proc/<pid>/smaps for any
-// process running as `uid`. Root (uid 0) is never filtered, so the injector
-// itself still sees the live mapping. A no-op (returns nil) when vma_hide is
-// inactive, so it never touches the file under --vma-hide=never.
-//
-// The wildcard "add 0x<s> 0x<e>" form (no uid) is kept by the kernel for
-// backward compatibility, but every xfinject call uses the explicit-uid
-// form so concurrent injections into different apps don't trample.
+// hideVma adds a per-UID hide entry to xfvmahide KPM via KernelPatch supercall.
+// The module filters this range out of /proc/<pid>/maps and /proc/<pid>/smaps
+// for processes running as `uid`. Root reads are never filtered, so xfinject
+// itself still sees the live mapping. A no-op when vma_hide is inactive.
 func hideVma(uid int, base uint64, end uint64) error {
 	if !vmaHideActive {
 		return nil
 	}
-	f, err := os.OpenFile(vmaHideProcPath, os.O_WRONLY, 0)
+	_, err := kpKpmControl(kpDefaultModuleName, fmt.Sprintf("add %d 0x%x 0x%x", uid, base, end))
 	if err != nil {
-		return fmt.Errorf("open %s: %w", vmaHideProcPath, err)
-	}
-	defer f.Close()
-	if _, err = fmt.Fprintf(f, "add %d 0x%x 0x%x\n", uid, base, end); err != nil {
-		return fmt.Errorf("write %s: %w", vmaHideProcPath, err)
+		return fmt.Errorf("xfvmahide add uid=%d start=0x%x end=0x%x: %w", uid, base, end, err)
 	}
 	return nil
 }
 
-// clearHiddenVmasForUID wipes only the entries belonging to one app UID.
+// clearHiddenVmasForUID wipes only the xfvmahide entries belonging to one app UID.
 // Called once at the start of each injection so stale entries from a previous
-// run into the same app don't shadow the new run's mappings. With the new
-// per-UID kernel module this is correctness-optional (the injector reads as
-// root and is never filtered) but still useful for tidiness across multiple
-// injections. A no-op when vma_hide is inactive.
+// run into the same app don't shadow the new run's mappings. A no-op when
+// vma_hide is inactive.
 func clearHiddenVmasForUID(uid int) error {
 	if !vmaHideActive {
 		return nil
 	}
-	f, err := os.OpenFile(vmaHideProcPath, os.O_WRONLY, 0)
+	_, err := kpKpmControl(kpDefaultModuleName, fmt.Sprintf("clear %d", uid))
 	if err != nil {
-		return fmt.Errorf("open %s: %w", vmaHideProcPath, err)
-	}
-	defer f.Close()
-	if _, err = fmt.Fprintf(f, "clear %d\n", uid); err != nil {
-		return fmt.Errorf("clear %s: %w", vmaHideProcPath, err)
+		return fmt.Errorf("xfvmahide clear uid=%d: %w", uid, err)
 	}
 	return nil
 }
 
 // SoinfoHideResult reports what UnlinkSoinfo accomplished for one payload, so the
 // caller can render an accurate terminal status instead of an unconditional
-// "cloaked". VmaActive mirrors whether /proc/vma_hide was in use this run; when
+// "cloaked". VmaActive mirrors whether xfvmahide was in use this run; when
 // false the payload's VMAs are intentionally left visible and VmaRanges/VmaHidden
 // stay zero.
 type SoinfoHideResult struct {
@@ -266,7 +247,7 @@ func (r SoinfoHideResult) FullyHidden() bool {
 
 // UnlinkSoinfo finds the payload on the linker's solist, hides every VMA
 // belonging to it (file-backed segments + linker guard pages + [anon:.bss])
-// from the app's UID via /proc/vma_hide, then patches it out of the linked
+// from the app's UID via xfvmahide, then patches it out of the linked
 // list so dl_iterate_phdr no longer sees it. The returned SoinfoHideResult lets
 // the caller report honestly whether hiding fully succeeded; a returned error is
 // a hard failure of the unlink itself (the payload could not be located/patched).

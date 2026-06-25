@@ -28,3 +28,6 @@ logtext.txt
 input.json
 jnilog.json
 *.log
+
+# Do not commit archived reference material
+reference/

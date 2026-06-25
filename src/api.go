@@ -144,7 +144,7 @@ func RunCLI(args []string) int {
 	logcat := fs.Bool("logcat", false, "stream logcat for the injected child after dlopen")
 	var logTags stringSlice
 	fs.Var(&logTags, "logtag", "stream logcat filtered to this tag (raw format; repeatable); implies -logcat")
-	vmaHide := fs.String("vma-hide", "auto", "/proc/vma_hide use: auto (on iff the module is present) | always | never")
+	vmaHide := fs.String("vma-hide", "auto", "xfvmahide use: auto (on iff xfvmahide KPM is loaded) | always | never")
 	autostartSymbol := fs.String("autostart-symbol", "", "optional payload symbol to call after dlopen(handle), before unlink")
 	autostartArg := fs.String("autostart-arg", "", "optional string argument passed to -autostart-symbol")
 	requestPath := fs.String("request", "", "JSON injection request file (service-mode skeleton)")
