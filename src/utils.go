@@ -284,10 +284,10 @@ func ResolveMainActivity(pkgName string) (string, error) {
 // LaunchPackage starts the target app in the most stable way available.
 //
 // Preference order:
-//   1. explicit launcher component, when we resolved one;
-//   2. generic launcher intent for the package;
-//   3. monkey fallback, which tends to work even when resolve-activity is
-//      blocked or the launcher alias is unusual.
+//  1. explicit launcher component, when we resolved one;
+//  2. generic launcher intent for the package;
+//  3. monkey fallback, which tends to work even when resolve-activity is
+//     blocked or the launcher alias is unusual.
 //
 // This keeps xfinject from hard-failing on packages that do not expose a
 // canonical ".MainActivity" component name.

@@ -13,7 +13,6 @@ import (
 const (
 	BackendZygoteTrap      = "zygote-trap"
 	DefaultAllowlistPath   = "/product/etc/xfinject/payloads.json"
-	DefaultKPMProcPath     = "/proc/xfinject_hide"
 	DefaultPayloadRoot     = "/product/lib64/xfinject"
 	DefaultDebugPayloadDir = "/data/local/tmp"
 )
@@ -39,9 +38,8 @@ type Request struct {
 	Hide            HideRequest `json:"hide,omitempty"`
 }
 
-// HideRequest reserves the service contract for a future KPM/kernel-side maps
-// hiding module. xfinject can pre-clear stale uid entries today; range add is
-// intentionally left to a backend that returns concrete VMA ranges.
+// HideRequest reserves the service contract for kernel-side maps hiding.
+// The current backend is xfvmahide KPM, driven through KernelPatch supercall.
 type HideRequest struct {
 	Enabled     bool   `json:"enabled,omitempty"`
 	Mode        string `json:"mode,omitempty"` // "none" | "kpm"
@@ -303,7 +301,7 @@ type ProcKPMClient struct {
 
 func (c ProcKPMClient) path() string {
 	if c.Path == "" {
-		return DefaultKPMProcPath
+		return "xfvmahide:kpm"
 	}
 	return c.Path
 }
