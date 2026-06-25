@@ -281,6 +281,40 @@ func ResolveMainActivity(pkgName string) (string, error) {
 	return "", fmt.Errorf("could not find main activity for %s", pkgName)
 }
 
+// LaunchPackage starts the target app in the most stable way available.
+//
+// Preference order:
+//   1. explicit launcher component, when we resolved one;
+//   2. generic launcher intent for the package;
+//   3. monkey fallback, which tends to work even when resolve-activity is
+//      blocked or the launcher alias is unusual.
+//
+// This keeps xfinject from hard-failing on packages that do not expose a
+// canonical ".MainActivity" component name.
+func LaunchPackage(pkgName, mainActivity string) error {
+	if mainActivity != "" {
+		if err := exec.Command("am", "start", "--activity-clear-task", "-n", mainActivity).Run(); err == nil {
+			return nil
+		}
+	}
+	if err := exec.Command(
+		"am",
+		"start",
+		"--activity-clear-task",
+		"-a", "android.intent.action.MAIN",
+		"-c", "android.intent.category.LAUNCHER",
+		"-p", pkgName,
+	).Run(); err == nil {
+		return nil
+	}
+	return exec.Command(
+		"monkey",
+		"-p", pkgName,
+		"-c", "android.intent.category.LAUNCHER",
+		"1",
+	).Run()
+}
+
 // GetAppUID returns the uid that owns /data/data/<pkg>. Zero on failure.
 func GetAppUID(pkgName string) int {
 	var st syscall.Stat_t

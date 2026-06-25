@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -204,8 +203,8 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 		// --activity-clear-task forces a cold respawn even if a stale task record
 		// exists (e.g. from a prior force-stop or failed injection), so zygote
 		// always forks a fresh child for our trap to catch.
-		if err := exec.Command("am", "start", "--activity-clear-task", "-n", mainActivity).Run(); err != nil {
-			return 0, fmt.Errorf("am start %s: %w", mainActivity, err)
+		if err := LaunchPackage(pkgName, mainActivity); err != nil {
+			return 0, fmt.Errorf("launch %s: %w", pkgName, err)
 		}
 	} else {
 		logger.Info("waiting for natural app launch", "package", pkgName)
