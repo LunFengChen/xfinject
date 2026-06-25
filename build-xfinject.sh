@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$ROOT/dist"
 mkdir -p "$OUT" "$OUT/tmp"
+cd "$ROOT"
 
 GO_BIN="${GO_BIN:-go}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK:-/home/xiaofeng/Android/Sdk/ndk/27.0.12077973}}"

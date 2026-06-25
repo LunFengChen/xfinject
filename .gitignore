@@ -1,6 +1,9 @@
 # Build output
 dist/
 build/
+/xfinjectd
+/libxfinject.so
+/libxfinject.h
 
 # IDE
 .vscode/
