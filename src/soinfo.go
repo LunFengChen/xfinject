@@ -153,11 +153,12 @@ func findPayloadVmaRanges(pid int, payloadPath string) ([]payloadVmaRange, error
 
 // vmaHideProcPath is the kernel module's control file. Its presence is what the
 // "auto" mode autodetects.
-// vmaHideActive gates every xfvmahide KPM interaction. Resolved once at startup
-// by SetVmaHideMode from the --vma-hide flag. When false, hideVma and
-// clearHiddenVmasForUID are silent no-ops and the injector leaves the payload's
-// VMAs visible in /proc/<pid>/maps (soinfo unlinking still happens — it is
-// independent of the kernel module).
+// vmaHideActive gates new xfvmahide entries for this run. Resolved once at
+// startup by SetVmaHideMode from the --vma-hide flag. When false, hideVma is a
+// silent no-op and the injector leaves the payload's VMAs visible in
+// /proc/<pid>/maps (soinfo unlinking still happens — it is independent of the
+// kernel module). clearHiddenVmasForUID also has a forced cleanup mode for stale
+// kernel-global entries left by earlier runs, even when this run disabled hide.
 var vmaHideActive bool
 
 // vmaHideStrict records that the operator passed --vma-hide=always, i.e. demanded
@@ -212,12 +213,12 @@ func hideVma(uid int, base uint64, end uint64) error {
 	return nil
 }
 
-// clearHiddenVmasForUID wipes only the xfvmahide entries belonging to one app UID.
-// Called once at the start of each injection so stale entries from a previous
-// run into the same app don't shadow the new run's mappings. A no-op when
-// vma_hide is inactive.
-func clearHiddenVmasForUID(uid int) error {
-	if !vmaHideActive {
+// clearHiddenVmasForUID wipes xfvmahide entries belonging to one app UID. Normal
+// calls follow vmaHideActive; force=true is used at injection start to clear
+// stale KPM state from previous runs before any stage-map scanning relies on
+// /proc/<pid>/maps being complete.
+func clearHiddenVmasForUID(uid int, force bool) error {
+	if !vmaHideActive && (!force || !kpXfvmahideAvailable()) {
 		return nil
 	}
 	_, err := kpKpmControl(kpDefaultModuleName, fmt.Sprintf("clear %d", uid))

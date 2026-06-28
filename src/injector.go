@@ -3,6 +3,7 @@ package xfinject
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -39,6 +40,22 @@ func uint64Bytes(v uint64) []byte {
 	return b
 }
 
+func discardTrapPageBestEffort(pid int, addr uint64, size int, reason string, attrs ...any) {
+	err := DiscardRemotePrivatePages(pid, addr, size)
+	logAttrs := append([]any{"pid", pid, "addr", addr}, attrs...)
+	if err == nil {
+		logger.Debug("trap page private copy discarded", append(logAttrs, "reason", reason)...)
+		return
+	}
+	if errors.Is(err, ErrRemoteDiscardUnsupported) {
+		logger.Debug("trap page private-copy discard unavailable; continuing with byte-level restore",
+			append(logAttrs, "reason", reason, "error", err)...)
+		return
+	}
+	logger.Debug("trap page private-copy discard failed; continuing with byte-level restore",
+		append(logAttrs, "reason", reason, "error", err)...)
+}
+
 // RunInjector orchestrates the stub-and-stage injection:
 //   - patches a 428-byte stub at zygote's setArgV0;
 //   - on the first matching fork, the stub mmaps the stage from a file and
@@ -65,10 +82,14 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 	logger.Debug("resolved app uid", "package", pkgName, "uid", targetUID)
 
 	// Clear any stale per-UID entries from a previous injection into this app.
-	// Correctness-optional with the per-UID kernel module (root reads aren't
-	// filtered) but keeps the list tidy across repeat runs.
-	if err := clearHiddenVmasForUID(targetUID); err != nil {
-		logger.Debug("clear vma_hide", "uid", targetUID, "error", err)
+	// This is intentionally forced even when the current run has --vma-hide=never:
+	// KPM state is kernel-global and may outlive the previous xfinject process,
+	// so an old xfvmahide entry can hide the newly-created stage mapping from
+	// /proc/<pid>/maps before this run has opted into hiding anything.
+	if err := clearHiddenVmasForUID(targetUID, true); err != nil {
+		logger.Debug("clear stale vma_hide", "uid", targetUID, "error", err)
+	} else {
+		logger.Debug("cleared stale vma_hide", "uid", targetUID)
 	}
 
 	const libAndroidPath = "/system/lib64/libandroid_runtime.so"
@@ -115,6 +136,7 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 		logger.Info("zygote self-healed from disk", "addr", setArgV0Addr)
 		origBackup = diskBytes
 	}
+	discardTrapPageBestEffort(zygotePid, setArgV0Addr, CUSTOM_TRAP_SIZE, "pre-injection self-heal")
 
 	linkerBase, err := GetModuleBase(zygotePid, "linker64")
 	if err != nil {
@@ -194,6 +216,7 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 				"addr", setArgV0Addr)
 			return
 		}
+		discardTrapPageBestEffort(zygotePid, setArgV0Addr, CUSTOM_TRAP_SIZE, "restore zygote trap")
 		logger.Debug("zygote trap restored", "addr", setArgV0Addr)
 		zygoteRestored = true
 	}
@@ -233,6 +256,7 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 	var childPid int
 	var childMailboxAddr uint64
 	var childSetArgV0Addr uint64
+	loggedCandidates := make(map[int]bool)
 	for time.Now().Before(detectDeadline) {
 		for pid := range ChildrenOf(zygotePid) {
 			if prevChildren[pid] || !IsProcessAlive(pid) {
@@ -240,6 +264,10 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 			}
 			ranges, err := ParseMaps(pid)
 			if err != nil {
+				if !loggedCandidates[pid] {
+					logger.Debug("stage candidate maps unavailable", "pid", pid, "error", err)
+					loggedCandidates[pid] = true
+				}
 				continue
 			}
 			// First pass: locate libandroid_runtime.so base. This MUST be a
@@ -256,6 +284,52 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 					childBase = r.Start
 					break
 				}
+			}
+			if !loggedCandidates[pid] {
+				rwxAnon := 0
+				for _, r := range ranges {
+					if r.Perms == "rwxp" && r.Path == "" {
+						rwxAnon++
+					}
+				}
+				trapState := "unknown"
+				trapHead := ""
+				if childBase != 0 {
+					childTrapAddr := childBase + (setArgV0Addr - zygoteBase)
+					if b, err := ReadMem(pid, childTrapAddr, min(16, len(trap))); err == nil {
+						trapHead = fmt.Sprintf("%x", b)
+						switch {
+						case len(b) <= len(trap) && bytes.Equal(b, trap[:len(b)]):
+							trapState = "installed"
+						case len(b) <= len(origBackup) && bytes.Equal(b, origBackup[:len(b)]):
+							trapState = "original"
+						default:
+							trapState = "other"
+						}
+					}
+				}
+				cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+				cmdlineText := strings.ReplaceAll(string(cmdline), "\x00", " ")
+				statusUID := ""
+				if status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid)); err == nil {
+					for _, line := range strings.Split(string(status), "\n") {
+						if strings.HasPrefix(line, "Uid:") {
+							statusUID = strings.TrimSpace(line)
+							break
+						}
+					}
+				}
+				logger.Debug("stage candidate observed",
+					"pid", pid,
+					"cmdline", strings.TrimSpace(cmdlineText),
+					"status_uid", statusUID,
+					"maps", len(ranges),
+					"child_base", childBase,
+					"rwx_anon", rwxAnon,
+					"trap_state", trapState,
+					"trap_head", trapHead,
+				)
+				loggedCandidates[pid] = true
 			}
 			if childBase == 0 {
 				continue
@@ -303,6 +377,7 @@ func RunInjector(pkgName string, libPaths []string, zygotePid int, mainActivity 
 	if err := WriteMem(childPid, childSetArgV0Addr, origBackup); err != nil {
 		return childPid, fmt.Errorf("restore child trap: %w", err)
 	}
+	discardTrapPageBestEffort(childPid, childSetArgV0Addr, CUSTOM_TRAP_SIZE, "restore child trap")
 	logger.Debug("child trap restored",
 		"addr", childSetArgV0Addr,
 		"size", len(origBackup),
